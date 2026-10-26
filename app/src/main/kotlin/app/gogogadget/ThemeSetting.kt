@@ -22,6 +22,9 @@ data class Palette(
     val navInactive: Long,
     val success: Long,
     val error: Long,
+    // Install button while it shows progress: its background, and its 1 px border / unlit segments.
+    val track: Long,
+    val trackLine: Long,
     val isDark: Boolean,
     val banner: Banner,
 )
@@ -39,6 +42,8 @@ val LightPalette = Palette(
     navInactive = 0xFF5B6675,
     success = 0xFF12A150,
     error = 0xFFD92D20,
+    track = 0xFFE6E9EE,
+    trackLine = 0x330B1220,
     isDark = false,
     banner = Banner.A,
 )
@@ -57,6 +62,8 @@ val BluePalette = Palette(
     navInactive = 0xFF0B1220,
     success = 0xFFFFFFFF,
     error = 0xFFFFFFFF,
+    track = 0xFF1769AA,
+    trackLine = 0x59FFFFFF,
     isDark = true,
     banner = Banner.B,
 )
@@ -74,6 +81,8 @@ val DarkPalette = Palette(
     navInactive = 0xFF9AA6B5,
     success = 0xFF12A150,
     error = 0xFFF04438,
+    track = 0xFF0A0A0A,
+    trackLine = 0x40FFFFFF,
     isDark = true,
     banner = Banner.C,
 )

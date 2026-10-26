@@ -28,12 +28,24 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
+import java.io.File
 import java.io.IOException
 import java.net.ConnectException
 import java.net.SocketTimeoutException
 
-/** Outcome of the last install attempt; [text] is the `pm` line or one of our own short messages. */
-data class InstallStatus(val working: Boolean, val ok: Boolean = false, val text: String = "")
+/**
+ * The last install attempt. [name] is the package name (or file name) once known; [percent] is 0..100 and stays
+ * visible with the result. A failure has a [reason] (string resource, null when unknown) and the raw [raw] line.
+ */
+data class InstallStatus(
+    val working: Boolean,
+    val ok: Boolean = false,
+    val name: String = "",
+    val percent: Int = 0,
+    val phase: InstallPhase = InstallPhase.Sending,
+    val reason: Int? = null,
+    val raw: String? = null,
+)
 
 private const val PREFS = "devices"
 private const val KEY_RECENT = "recent"
@@ -372,41 +384,74 @@ class ConnectionModel(
             val result = try {
                 installApk(uri)
             } catch (e: CancellationException) {
+                // A reconnect clears `install` first, so this only shows when the job was cancelled in place.
+                if (install?.working == true) install = failed(install, transferFailure(e, null))
                 throw e
             } catch (e: IOException) {
                 // Only a gone session is a lost connection; a stream that ended or timed out leaves it up.
-                if (installErrorIsConnectionLoss(adb.isConnected)) {
-                    connection = Connection(ConnectionState.Error, connection.device, AdbError.ConnectionLost, diagnostic(e))
-                    null
-                } else {
-                    failure(R.string.err_install_failed, diagnostic(e))
-                }
+                val lost = installErrorIsConnectionLoss(adb.isConnected)
+                if (lost) connection = Connection(ConnectionState.Error, connection.device, AdbError.ConnectionLost, diagnostic(e))
+                failed(install, transferFailure(e, diagnostic(e), sessionConnected = !lost))
             } catch (e: Exception) {
-                failure(R.string.err_install_failed)
+                failed(install, transferFailure(e, diagnostic(e)))
             }
             install = result
         }
     }
 
-    private fun failure(res: Int, detail: String? = null): InstallStatus {
-        val text = getApplication<Application>().getString(res)
-        return InstallStatus(false, false, if (detail == null) text else "$text $detail")
-    }
+    private fun failed(status: InstallStatus?, failure: InstallFailure) =
+        (status ?: InstallStatus(false)).copy(working = false, ok = false, reason = failure.reason, raw = failure.raw)
 
-    /** Streams the APK through the ADB connection: nothing is copied to disk or needs to be readable on the device. */
+    private fun failure(res: Int) = failed(install, InstallFailure(res, null))
+
+    /** Streams the APK through the ADB connection: nothing is copied to the device. The app only makes a short-lived cache copy to read the package name. */
     private suspend fun installApk(uri: Uri): InstallStatus {
         val resolver = getApplication<Application>().contentResolver
-        val (name, size) = withContext(Dispatchers.IO) { fileInfo(uri) }
-        if (!isSingleApk(name)) return failure(R.string.err_not_apk)
+        val (fileName, size) = withContext(Dispatchers.IO) { fileInfo(uri) }
+        val mine = generation
+        val generic = getApplication<Application>().getString(R.string.unnamed_package)
+        install = install?.copy(name = installLabel(null, fileName, generic))
+        if (!isSingleApk(fileName)) return failure(R.string.err_read_file)
         if (size == null || size <= 0) return failure(R.string.err_read_file)
+        // The name shown is the applicationId when the manifest can be read, else the file name.
+        val label = installLabel(withContext(Dispatchers.IO) { packageNameOf(uri) }, fileName, generic)
+        if (mine != generation) throw CancellationException()
+        install = install?.copy(name = label)
+        fun report(sent: Long) {
+            if (mine != generation) return
+            val state = installPhase(sent, size, answered = false)
+            install = install?.takeIf { it.working }?.copy(percent = state.percent, phase = state.phase)
+        }
         // The client's own watchdog times the stream out; a slow install must never close the whole session.
         suspend fun attempt(bypass: Boolean): String? = blocking(INSTALL_TIMEOUT_MS, disconnectOnTimeout = false) {
-            resolver.openInputStream(uri)?.use { adb.install(streamInstallCommand(size, bypass), size, it) }
+            report(0)
+            resolver.openInputStream(uri)?.use { adb.install(streamInstallCommand(size, bypass), size, it, ::report) }
         }
         var output = attempt(bypass = true) ?: return failure(R.string.err_read_file)
         if (shouldRetryWithoutBypass(output)) output = attempt(bypass = false) ?: return failure(R.string.err_read_file)
         val result = parsePmOutput(output)
-        return InstallStatus(false, result.success, result.line)
+        val status = install ?: InstallStatus(false, name = label)
+        return if (result.success) status.copy(working = false, ok = true, percent = 100, phase = InstallPhase.Done)
+        else failed(status, pmFailure(result.line))
+    }
+
+    /**
+     * The applicationId from the APK's manifest, read by the platform on a temporary copy in the app cache (the
+     * picked file is a content Uri); null when it cannot be read. The copy is always deleted.
+     */
+    private fun packageNameOf(uri: Uri): String? {
+        val app = getApplication<Application>()
+        val copy = File.createTempFile("parse", ".apk", app.cacheDir)
+        return try {
+            app.contentResolver.openInputStream(uri)?.use { input -> copy.outputStream().use { input.copyTo(it) } }
+                ?: return null
+            @Suppress("DEPRECATION")
+            app.packageManager.getPackageArchiveInfo(copy.path, 0)?.packageName
+        } catch (e: Exception) {
+            null
+        } finally {
+            copy.delete()
+        }
     }
 
     private fun fileInfo(uri: Uri): Pair<String?, Long?> = runCatching {
@@ -421,7 +466,7 @@ class ConnectionModel(
     }.getOrNull() ?: (null to null)
 
     fun installUnavailable() {
-        install = failure(R.string.err_no_picker)
+        install = InstallStatus(false, reason = R.string.err_no_picker)
     }
 
     override fun onCleared() {

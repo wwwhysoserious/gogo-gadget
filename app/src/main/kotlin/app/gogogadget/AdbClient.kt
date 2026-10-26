@@ -27,9 +27,10 @@ interface AdbClient {
 
     /**
      * Streams exactly [size] bytes from [apk] into [command] (`cmd package install -S <size> ...`) and returns
-     * its output. Works for any connected device, local or not.
+     * its output. Works for any connected device, local or not. [onProgress] gets the bytes written so far, about ten
+     * times a second and once more when the last byte is out.
      */
-    fun install(command: String, size: Long, apk: InputStream): String
+    fun install(command: String, size: Long, apk: InputStream, onProgress: (Long) -> Unit = {}): String
 
     fun disconnect()
 }
@@ -81,11 +82,11 @@ class LibAdbClient(context: Context) : AdbClient {
     }
 
     // "exec:" keeps stdin binary-safe (no pty); the command stops reading after -S bytes, so no EOF is needed.
-    override fun install(command: String, size: Long, apk: InputStream): String {
+    override fun install(command: String, size: Long, apk: InputStream, onProgress: (Long) -> Unit): String {
         val output = manager.openStream("exec:${withEndMarker(command)}").use { stream ->
             stream.guarded(installTimeoutMs(size)) {
                 val writeError = try {
-                    writeExactly(stream.openOutputStream(), apk, size)
+                    writeExactly(stream.openOutputStream(), apk, size, onProgress)
                     null
                 } catch (e: IOException) {
                     e
@@ -100,14 +101,17 @@ class LibAdbClient(context: Context) : AdbClient {
         return outputBeforeMarker(output) ?: output
     }
 
-    private fun writeExactly(out: OutputStream, apk: InputStream, size: Long) {
+    private fun writeExactly(out: OutputStream, apk: InputStream, size: Long, onProgress: (Long) -> Unit) {
         val buffer = ByteArray(64 * 1024)
+        val throttle = ProgressThrottle()
         var left = size
         while (left > 0) {
             val n = apk.read(buffer, 0, minOf(buffer.size.toLong(), left).toInt())
             if (n < 0) throw FileEndedException(size)
             out.write(buffer, 0, n)
             left -= n
+            val sent = size - left
+            if (throttle.shouldReport(System.nanoTime() / 1_000_000L, sent, size)) onProgress(sent)
         }
         out.flush()
     }

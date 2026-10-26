@@ -44,6 +44,9 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.layout.ContentScale
@@ -57,7 +60,9 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.ProgressBarRangeInfo
 import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.progressBarRangeInfo
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontFamily
@@ -66,10 +71,15 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.delay
+import kotlin.math.roundToInt
 
 val Margin = 24.dp
 private val PanelHeight = 260.dp
 private val NodeSize = 72.dp
+private val ProgressInset = 4.dp
+private const val ResultHoldMs = 4_000L
 
 @Composable
 fun Divider(palette: Palette) =
@@ -154,30 +164,120 @@ fun HomeScreen(
                         )
                     }
                     Spacer(Modifier.height(16.dp))
-                    Button(
-                        onClick = { onButton(button.action) },
-                        modifier = Modifier.fillMaxWidth().height(56.dp),
-                        shape = RectangleShape,
-                        colors = ButtonDefaults.buttonColors(),
-                        elevation = null,
-                    ) { Text(stringResource(button.label), style = MaterialTheme.typography.labelLarge) }
-                    // Minimum-height slot so the button does not move when the line appears; wraps if needed.
-                    Box(Modifier.fillMaxWidth().heightIn(min = 48.dp).padding(top = 12.dp)) {
-                        val (text, color) = when {
-                            install != null -> when {
-                                install.working -> stringResource(R.string.installing) to palette.secondary
-                                install.ok -> install.text to palette.success
-                                else -> install.text to palette.error
-                            }
-                            connection.state == ConnectionState.Connected -> stringResource(R.string.formats) to palette.secondary
-                            else -> null to 0L
+                    // The button shows the install progress while it runs and holds the result for ~4 s (or until tapped).
+                    var holding by remember { mutableStateOf(false) }
+                    val working = install?.working == true
+                    LaunchedEffect(working) {
+                        if (working) holding = true
+                        else if (holding) {
+                            delay(ResultHoldMs)
+                            holding = false
                         }
-                        if (text != null) {
-                            Text(text, style = MaterialTheme.typography.bodyMedium, color = Color(color))
+                    }
+                    if ((working || holding) && install != null) {
+                        ProgressButton(palette, install, onDismiss = { holding = false })
+                    } else {
+                        Button(
+                            onClick = { onButton(button.action) },
+                            modifier = Modifier.fillMaxWidth().height(56.dp),
+                            shape = RectangleShape,
+                            colors = ButtonDefaults.buttonColors(),
+                            elevation = null,
+                        ) { Text(stringResource(button.label), style = MaterialTheme.typography.labelLarge) }
+                    }
+                    // Minimum-height slot so the button does not move when the install block appears; wraps if needed.
+                    Box(Modifier.fillMaxWidth().heightIn(min = 48.dp).padding(top = 12.dp)) {
+                        when {
+                            install != null -> InstallBlock(palette, install)
+                            connection.state == ConnectionState.Connected ->
+                                Text(stringResource(R.string.formats), style = MaterialTheme.typography.bodyMedium, color = Color(palette.secondary))
                         }
                     }
                 }
             }
+        }
+    }
+}
+
+/** Package name (or file name), plus the plain failure reason and the collapsible raw diagnostic line. */
+@Composable
+private fun InstallBlock(palette: Palette, install: InstallStatus) {
+    Column(Modifier.fillMaxWidth()) {
+        if (install.name.isNotEmpty()) {
+            Text(
+                install.name,
+                style = MaterialTheme.typography.bodyMedium,
+                color = Color(palette.text),
+            )
+        }
+        if (!install.working && !install.ok) {
+            // Only the plain sentence on the main screen; the raw line stays behind "Details" (diagnostic until v1.0).
+            Text(
+                stringResource(install.reason ?: R.string.reason_unknown),
+                style = MaterialTheme.typography.bodyMedium,
+                color = Color(palette.text),
+            )
+            install.raw?.let { raw ->
+                var open by remember(raw) { mutableStateOf(false) }
+                Text(
+                    stringResource(R.string.details),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color(palette.secondary),
+                    modifier = Modifier.clickable(role = Role.Button) { open = !open }
+                        .heightIn(min = 48.dp).padding(top = 14.dp),
+                )
+                if (open) Text(raw, style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace, color = Color(palette.secondary))
+            }
+        }
+    }
+}
+
+/**
+ * The main button while an install runs and for ~4 s after: a flat track with ONE solid fill (success colour, error
+ * colour after a failure). While running, its width is [fillWidthPx] of the inner width and the running caption is
+ * centred in [MaterialTheme.typography.labelMedium]. When finished, the fill covers the full bar and the result
+ * ("Success" or "Not installed") is centred in bold 20 sp; tapping the bar returns immediately to the normal button.
+ */
+@Composable
+private fun ProgressButton(palette: Palette, install: InstallStatus, onDismiss: () -> Unit) {
+    val track = Color(palette.track)
+    val fill = Color(if (install.working || install.ok) palette.success else palette.error)
+    val onFill = if (fill.luminance() > 0.4f) Color.Black else Color.White
+    val fillPercent = barFillPercent(install.working, install.percent)
+    val caption = when {
+        !install.working && install.ok -> stringResource(R.string.status_success)
+        !install.working -> stringResource(R.string.status_not_installed)
+        install.phase == InstallPhase.Installing -> stringResource(R.string.phase_installing)
+        else -> stringResource(R.string.phase_sending, install.percent)
+    }
+    val textStyle = if (install.working) {
+        MaterialTheme.typography.labelMedium
+    } else {
+        MaterialTheme.typography.labelLarge.copy(fontSize = 20.sp, lineHeight = 24.sp, fontWeight = FontWeight.Bold)
+    }
+    Box(
+        Modifier.fillMaxWidth().height(56.dp).background(track).border(1.dp, Color(palette.trackLine))
+            .then(if (!install.working) Modifier.clickable(role = Role.Button, onClick = onDismiss) else Modifier)
+            .padding(ProgressInset)
+            .semantics(mergeDescendants = true) {
+                contentDescription = caption
+                if (install.working) progressBarRangeInfo = ProgressBarRangeInfo(install.percent / 100f, 0f..1f)
+            },
+    ) {
+        Canvas(Modifier.fillMaxSize()) {
+            drawRect(fill, Offset.Zero, androidx.compose.ui.geometry.Size(fillWidthPx(size.width.roundToInt(), fillPercent).toFloat(), size.height))
+        }
+        Box(Modifier.fillMaxSize().clearAndSetSemantics {}, contentAlignment = Alignment.Center) {
+            Text(caption, style = textStyle, color = Color(palette.text), maxLines = 1)
+        }
+        Box(
+            Modifier.fillMaxSize().clearAndSetSemantics {}.drawWithContent {
+                val w = fillWidthPx(size.width.roundToInt(), fillPercent).toFloat()
+                clipRect(0f, 0f, w, size.height) { this@drawWithContent.drawContent() }
+            },
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(caption, style = textStyle, color = onFill, maxLines = 1)
         }
     }
 }
@@ -233,84 +333,88 @@ private fun ConnectionPanel(
             }
             Node(palette, R.string.adb, Glyph.Terminal)
         }
-        Spacer(Modifier.height(12.dp))
-        connection.error?.let {
-            Text(
-                stringResource(it.message),
-                style = MaterialTheme.typography.bodyMedium,
-                color = Color(palette.error),
-                textAlign = TextAlign.Center,
-                modifier = Modifier.padding(bottom = if (connection.detail == null) 8.dp else 2.dp),
-            )
-            // Temporary (remove before v1.0): the real cause, so a failure on a device can be diagnosed.
-            connection.detail?.let { detail ->
-                Text(
-                    detail,
-                    style = MaterialTheme.typography.bodySmall,
-                    fontFamily = FontFamily.Monospace,
-                    color = secondary,
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier.padding(bottom = 8.dp),
-                )
-            }
-        }
-        when (state) {
-            ConnectionState.Pairing -> PairingForm(
-                palette, connection.device?.local != false, pairPort, onCode, onRepost, notificationsOk, onAllowNotifications,
-                onOpenDeveloperOptions,
-            )
-            ConnectionState.Connected -> connection.device?.let { device ->
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Box(Modifier.size(12.dp).background(Color(palette.success)))
-                    Spacer(Modifier.width(8.dp))
+        // The state text is centred, both ways, in the space left under the diagram.
+        Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+            Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+                connection.error?.let {
                     Text(
-                        device.name,
+                        stringResource(it.message),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = Color(palette.error),
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.padding(bottom = if (connection.detail == null) 8.dp else 2.dp),
+                    )
+                    // Temporary (remove before v1.0): the real cause, so a failure on a device can be diagnosed.
+                    connection.detail?.let { detail ->
+                        Text(
+                            detail,
+                            style = MaterialTheme.typography.bodySmall,
+                            fontFamily = FontFamily.Monospace,
+                            color = secondary,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier.padding(bottom = 8.dp),
+                        )
+                    }
+                }
+                when (state) {
+                    ConnectionState.Pairing -> PairingForm(
+                        palette, connection.device?.local != false, pairPort, onCode, onRepost, notificationsOk, onAllowNotifications,
+                        onOpenDeveloperOptions,
+                    )
+                    ConnectionState.Connected -> connection.device?.let { device ->
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Box(Modifier.size(12.dp).background(Color(palette.success)))
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                device.name,
+                                style = MaterialTheme.typography.bodyLarge,
+                                fontWeight = FontWeight.Medium,
+                                color = text,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                        Text(
+                            stringResource(if (device.local) R.string.subtitle_this_device else R.string.subtitle_network),
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = secondary,
+                        )
+                        Text(
+                            hostPort(device.host, device.port),
+                            style = MaterialTheme.typography.bodySmall,
+                            fontFamily = FontFamily.Monospace,
+                            color = secondary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    ConnectionState.Connecting -> {
+                        Text(
+                            stringResource(R.string.connecting),
+                            style = MaterialTheme.typography.bodyLarge,
+                            fontWeight = FontWeight.Medium,
+                            color = text,
+                        )
+                        // Where to tap Allow: the other device (or Android on this phone) shows the prompt, not this app.
+                        connection.note?.let {
+                            Text(
+                                stringResource(it),
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = secondary,
+                                textAlign = TextAlign.Center,
+                                modifier = Modifier.padding(top = 8.dp),
+                            )
+                        }
+                    }
+                    ConnectionState.NotConnected -> Text(
+                        stringResource(R.string.not_connected),
                         style = MaterialTheme.typography.bodyLarge,
                         fontWeight = FontWeight.Medium,
                         color = text,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
                     )
-                }
-                Text(
-                    stringResource(if (device.local) R.string.subtitle_this_device else R.string.subtitle_network),
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = secondary,
-                )
-                Text(
-                    hostPort(device.host, device.port),
-                    style = MaterialTheme.typography.bodySmall,
-                    fontFamily = FontFamily.Monospace,
-                    color = secondary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-            ConnectionState.Connecting -> {
-                Text(
-                    stringResource(R.string.connecting),
-                    style = MaterialTheme.typography.bodyLarge,
-                    fontWeight = FontWeight.Medium,
-                    color = text,
-                )
-                // Where to tap Allow: the other device (or Android on this phone) shows the prompt, not this app.
-                connection.note?.let {
-                    Text(
-                        stringResource(it),
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = secondary,
-                        textAlign = TextAlign.Center,
-                        modifier = Modifier.padding(top = 8.dp),
-                    )
+                    ConnectionState.Error -> {}
                 }
             }
-            ConnectionState.NotConnected -> Text(
-                stringResource(R.string.not_connected),
-                style = MaterialTheme.typography.bodyLarge,
-                fontWeight = FontWeight.Medium,
-                color = text,
-            )
-            ConnectionState.Error -> {}
         }
     }
 }
