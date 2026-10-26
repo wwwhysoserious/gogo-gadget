@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">GoGo Gadget</string>
+    <string name="banner_description">GoGo Gadget</string>
+    <string name="home_title">Select your package</string>
+    <string name="choose_file">Choose file</string>
+    <string name="formats">Supported: APK · XAPK · APKM · APKS · ZIP (split APKs)</string>
+    <string name="wireless_not_connected">Wireless debugging: not connected</string>
+    <string name="unnamed_file">Unnamed file</string>
+    <string name="settings">Settings</string>
+    <string name="back">Back</string>
+    <string name="theme">Theme</string>
+    <string name="theme_system">System</string>
+    <string name="theme_light">Light</string>
+    <string name="theme_blue">Blue</string>
+    <string name="theme_dark">Dark</string>
+</resources>
