@@ -219,6 +219,17 @@ class AdbLogicTest {
         assertEquals("cmd package install -S 1234 -r -d", streamInstallCommand(1234, bypass = false))
     }
 
+    @Test fun installCommandAppendsTheUserInstallReasonOnlyWhenAsked() {
+        assertEquals(4, InstallReasonUser)
+        assertEquals(
+            "cmd package install -S 1234 -r -d --bypass-low-target-sdk-block --install-reason 4",
+            streamInstallCommand(1234, bypass = true, userInstall = true),
+        )
+        assertEquals("cmd package install -S 1234 -r -d --install-reason 4", streamInstallCommand(1234, bypass = false, userInstall = true))
+        assertEquals("cmd package install -S 1234 -r -d --bypass-low-target-sdk-block", streamInstallCommand(1234, bypass = true, userInstall = false))
+        assertEquals("cmd package install -S 1234 -r -d", streamInstallCommand(1234, bypass = false, userInstall = false))
+    }
+
     @Test fun installWriteSuccessLineCountsAsSuccess() {
         assertEquals(PmResult(true, "Success"), parsePmOutput("Success: streamed 4096 bytes\n"))
         assertEquals(PmResult(true, "Success"), parsePmOutput("Success: created install session [123456]\n"))

@@ -608,8 +608,9 @@ private val SessionIdRegex = Regex("""Success:.*\[(\d+)\]""")
 private val UnsafeSplitCharRegex = Regex("[^A-Za-z0-9._-]")
 private val UnsafePackageCharRegex = Regex("[^A-Za-z0-9._]")
 
-fun createSessionCommand(bypass: Boolean = true): String =
-    "pm install-create -r -d${if (bypass) " --bypass-low-target-sdk-block" else ""}"
+fun createSessionCommand(bypass: Boolean = true, userInstall: Boolean = false): String =
+    "pm install-create -r -d${if (bypass) " --bypass-low-target-sdk-block" else ""}" +
+        if (userInstall) " --install-reason $InstallReasonUser" else ""
 
 fun parseSessionId(output: String): Long? =
     output.replace("\r", "")
@@ -656,16 +657,23 @@ fun installBundleSession(
     obbs: List<ExtractedFile> = emptyList(),
     packageName: String? = null,
     onProgress: (sent: Long, total: Long) -> Unit = { _, _ -> },
+    onLog: (String) -> Unit = {},
+    userInstall: Boolean = false,
 ): PmResult {
     val totalBytes = splits.sumOf { it.size.coerceAtLeast(0L) } + obbs.sumOf { it.size.coerceAtLeast(0L) }
     onProgress(0L, totalBytes)
 
-    var createOut = adb.shell(createSessionCommand(bypass = true))
+    val createCmd = createSessionCommand(bypass = true, userInstall = userInstall)
+    onLog("> adb: $createCmd (0 permissions granted)")
+    var createOut = adb.shell(createCmd)
     if (shouldRetryWithoutBypass(createOut)) {
-        createOut = adb.shell(createSessionCommand(bypass = false))
+        val fallbackCmd = createSessionCommand(bypass = false, userInstall = userInstall)
+        onLog("> adb: retrying $fallbackCmd")
+        createOut = adb.shell(fallbackCmd)
     }
     val sessionId = parseSessionId(createOut)
         ?: return PmResult(false, parsePmOutput(createOut).line)
+    onLog("> session: created [$sessionId] for ${splits.size} split(s)")
 
     var committed = false
     try {
@@ -675,6 +683,7 @@ fun installBundleSession(
             val baseSafe = sanitizeSplitName(split.name)
             val safeName = if (usedNames.add(baseSafe)) baseSafe else "${index}_$baseSafe"
             val cmd = installWriteCommand(sessionId, safeName, split.size)
+            onLog("> adb: install-write [${index + 1}/${splits.size}] $safeName (${split.size} B)")
             val writeOut = split.openStream().use { stream ->
                 adb.writeStream(cmd, split.size, stream) { sent ->
                     onProgress((completedBytes + sent).coerceAtMost(totalBytes), totalBytes)
@@ -699,6 +708,7 @@ fun installBundleSession(
                     adb.shell(obbMkdirCommand(targetPkg))
                 }
                 val cmd = obbWriteCommand(targetPkg, obb.name, obb.size)
+                onLog("> adb: streaming OBB ${obb.name} (${obb.size} B)")
                 val obbOut = obb.openStream().use { stream ->
                     adb.writeStream(cmd, obb.size, stream) { sent ->
                         onProgress((completedBytes + sent).coerceAtMost(totalBytes), totalBytes)
@@ -713,7 +723,9 @@ fun installBundleSession(
         }
 
         committed = true
-        val commitOut = adb.shell(installCommitCommand(sessionId))
+        val commitCmd = installCommitCommand(sessionId)
+        onLog("> adb: $commitCmd")
+        val commitOut = adb.shell(commitCmd)
         return parsePmOutput(commitOut)
     } finally {
         if (!committed) {

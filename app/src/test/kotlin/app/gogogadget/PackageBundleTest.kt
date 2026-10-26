@@ -332,6 +332,16 @@ class PackageBundleTest {
 
     // ---- Session commands, progress aggregation & abandon on failure ----
 
+    @Test fun sessionCommandAppendsTheUserInstallReasonOnlyWhenAsked() {
+        assertEquals(
+            "pm install-create -r -d --bypass-low-target-sdk-block --install-reason 4",
+            createSessionCommand(bypass = true, userInstall = true),
+        )
+        assertEquals("pm install-create -r -d --install-reason 4", createSessionCommand(bypass = false, userInstall = true))
+        assertEquals("pm install-create -r -d --bypass-low-target-sdk-block", createSessionCommand(bypass = true, userInstall = false))
+        assertEquals("pm install-create -r -d", createSessionCommand(bypass = false, userInstall = false))
+    }
+
     @Test fun sessionAndObbCommandsAreFormattedAndSanitized() {
         assertEquals(
             "pm install-create -r -d --bypass-low-target-sdk-block",
@@ -513,6 +523,7 @@ class PackageBundleTest {
             Class.forName("app.gogogadget.PackageBundleKt"),
             Class.forName("app.gogogadget.AdbLogicKt"),
             Class.forName("app.gogogadget.InstallLogicKt"),
+            Class.forName("app.gogogadget.SecurityShieldKt"),
         )
         val regexPatterns = mutableListOf<Pair<String, String>>()
         for (cls in classes) {

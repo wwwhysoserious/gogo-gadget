@@ -36,8 +36,8 @@ fun packageResultMark(working: Boolean, ok: Boolean): PackageResultMark = when {
     else -> PackageResultMark.Cross
 }
 
-/** What the caption inside the button says: bytes still going out, waiting for pm's answer, or finished. */
-enum class InstallPhase { Sending, Installing, Done }
+/** What the caption inside the button says: checking the package, bytes still going out, waiting for pm's answer, or finished. */
+enum class InstallPhase { Checking, Sending, Installing, Done }
 
 data class PhaseState(val phase: InstallPhase, val percent: Int)
 
@@ -143,3 +143,4 @@ fun transferFailure(e: Throwable, detail: String?, sessionConnected: Boolean = t
     }
     return InstallFailure(reason, detail)
 }
+

@@ -45,6 +45,9 @@ data class InstallStatus(
     val phase: InstallPhase = InstallPhase.Sending,
     val reason: Int? = null,
     val raw: String? = null,
+    val shieldVerdict: ShieldVerdict? = null,
+    val shieldChecking: Boolean = false,
+    val logs: List<String> = emptyList(),
 )
 
 private const val PREFS = "devices"
@@ -67,6 +70,8 @@ class ConnectionModel(
     constructor(app: Application) : this(app, Graph.adb(app), Graph.discovery(app), ServicePairingLauncher(app))
 
     private val prefs = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+    val shieldSettings = ShieldSettingsStore(app)
+    private val installSettings = InstallSettingsStore(app)
 
     var connection by mutableStateOf(Connection())
         private set
@@ -379,7 +384,9 @@ class ConnectionModel(
     /** [uri] is null when the picker was cancelled; only one install runs at a time. */
     fun installFrom(uri: Uri?) {
         if (uri == null || connection.state != ConnectionState.Connected || install?.working == true) return
-        install = InstallStatus(working = true)
+        val shieldOn = shieldSettings.shieldEnabled
+        val initialPhase = if (shieldOn) InstallPhase.Checking else InstallPhase.Sending
+        install = InstallStatus(working = true, phase = initialPhase, shieldChecking = shieldOn)
         installJob = viewModelScope.launch {
             val result = try {
                 installApk(uri)
@@ -400,9 +407,35 @@ class ConnectionModel(
     }
 
     private fun failed(status: InstallStatus?, failure: InstallFailure) =
-        (status ?: InstallStatus(false)).copy(working = false, ok = false, reason = failure.reason, raw = failure.raw)
+        (status ?: InstallStatus(false)).copy(
+            working = false,
+            ok = false,
+            reason = failure.reason,
+            raw = failure.raw,
+            shieldVerdict = status?.shieldVerdict,
+            shieldChecking = false,
+            logs = status?.logs.orEmpty() + listOfNotNull(failure.raw?.takeIf { it.isNotBlank() }?.let { "> error: $it" }),
+        )
 
     private fun failure(res: Int) = failed(install, InstallFailure(res, null))
+
+    private fun appendLog(mine: Int, line: String) {
+        if (mine == generation) {
+            install = install?.copy(logs = install?.logs.orEmpty() + line)
+        }
+    }
+
+    private fun postLog(mine: Int, line: String) {
+        viewModelScope.launch {
+            appendLog(mine, line)
+        }
+    }
+
+    private fun formatByteSize(bytes: Long): String = when {
+        bytes >= 1024L * 1024L -> String.format(java.util.Locale.US, "%.2f MB (%d B)", bytes / (1024.0 * 1024.0), bytes)
+        bytes >= 1024L -> String.format(java.util.Locale.US, "%.1f KB (%d B)", bytes / 1024.0, bytes)
+        else -> "$bytes B"
+    }
 
     private fun updateInstallProgress(mine: Int, sent: Long, total: Long) {
         val state = installPhase(sent, total, answered = false)
@@ -414,16 +447,142 @@ class ConnectionModel(
     }
 
     /**
-     * Inspects the picked file by content (magic bytes and ZIP central directory) and installs it over ADB:
-     * single APKs use the fast single-command stream, while APKS/XAPK/APKM/ZIP bundles extract into a dedicated
-     * temporary directory under external/internal cache, filter splits for the target device, and run a multi-APK
-     * session (plus OBB streaming when present). The temporary directory is always deleted in `finally`.
+     * Runs the Antivirus shield check (SHA-256 + offline signature/manifest analysis + optional VirusTotal lookup).
+     * Returns null when the shield is disabled, or the evaluated [ShieldVerdict] when enabled.
+     */
+    private suspend fun verifyPackageWithShield(
+        mine: Int,
+        app: Application,
+        sourceFile: File,
+        bundle: ExtractedBundle,
+        pkg: String?,
+        isLocalDevice: Boolean,
+    ): ShieldVerdict? {
+        if (!shieldSettings.shieldEnabled) {
+            appendLog(mine, "> shield: OFF (disabled in settings)")
+            return null
+        }
+        appendLog(mine, "> shield: scanning archive, X.509 certificates & AndroidManifest.xml...")
+        val installedInfo = if (!pkg.isNullOrBlank()) {
+            try {
+                blocking(CONNECT_TIMEOUT_MS, disconnectOnTimeout = false) {
+                    queryInstalledAppInfo(adb, pkg, app.takeIf { isLocalDevice })
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Throwable) {
+                null
+            }
+        } else {
+            null
+        }
+
+        val (sha256, offline) = withContext(Dispatchers.IO) {
+            val hash = sha256Hex(sourceFile)
+            val archiveApk = if (bundle.format == PackageFormat.SingleApk) sourceFile else bundle.findBaseApk()?.file
+            val candidateInfo = archiveApk?.let { queryArchiveAppInfo(app, it) } ?: InstalledAppInfo(null, null)
+            val report = analyzePackageOffline(
+                sourceFile = sourceFile,
+                bundle = bundle,
+                installedSigSha256 = installedInfo?.sigSha256,
+                installedVersionCode = installedInfo?.versionCode,
+                candidateSigSha256 = candidateInfo.sigSha256,
+                candidateVersionCode = candidateInfo.versionCode,
+                candidateDebugOrTest = candidateInfo.debugOrTestSigned,
+                candidateCertSubject = candidateInfo.certSubject,
+            )
+            hash to report
+        }
+
+        appendLog(mine, "> sha256: $sha256")
+        offline.versionCode?.let { vc ->
+            appendLog(mine, "> versionCode: $vc${installedInfo?.versionCode?.let { " (installed on target: $it)" }.orEmpty()}")
+        }
+        val sigDetail = offline.certSubject ?: offline.signerSha256?.let(::truncateSha256) ?: "unknown"
+        when {
+            !offline.signed -> appendLog(mine, "> signature: UNSIGNED (no valid V1/V2/V3 certificate)")
+            offline.debugOrTestSigned -> appendLog(mine, "> signature: UNTRUSTED TEST/MOD KEY ($sigDetail)")
+            offline.signatureMismatch -> appendLog(mine, "> signature: MISMATCH vs installed app ($sigDetail)")
+            else -> appendLog(mine, "> signature: VALID ($sigDetail)")
+        }
+        if (offline.allPermissions.isEmpty()) {
+            appendLog(mine, "> permissions: 0 requested in AndroidManifest.xml (0 auto-granted)")
+        } else {
+            appendLog(
+                mine,
+                "> permissions (${offline.allPermissions.size} requested, 0 auto-granted — user decides): ${offline.allPermissions.joinToString(", ")}",
+            )
+        }
+        if (offline.highRiskPermissions.isNotEmpty()) {
+            appendLog(mine, "> high-risk flags: ${offline.highRiskPermissions.joinToString(", ")}")
+        }
+
+        val apiKey = withContext(Dispatchers.IO) { shieldSettings.loadVirusTotalApiKey() }
+        val vt = if (!apiKey.isNullOrBlank()) {
+            appendLog(mine, "> virustotal: GET /api/v3/files/${truncateSha256(sha256)}...")
+            val res = withContext(Dispatchers.IO) { checkVirusTotalHash(sha256, apiKey) }
+            when (res) {
+                is VtLookupResult.Found -> appendLog(mine, "> virustotal: ${res.malicious} malicious, ${res.suspicious} suspicious / ${res.total} engines")
+                VtLookupResult.UnknownHash -> appendLog(mine, "> virustotal: hash not in database (404)")
+                VtLookupResult.InvalidKey -> appendLog(mine, "> virustotal: API key rejected (401/403)")
+                VtLookupResult.RateLimited -> appendLog(mine, "> virustotal: rate limited (429)")
+                VtLookupResult.Unavailable -> appendLog(mine, "> virustotal: unreachable / offline")
+            }
+            res
+        } else {
+            appendLog(mine, "> virustotal: skipped (no API key configured — offline shield only)")
+            null
+        }
+
+        val verdict = evaluateShieldVerdict(
+            sha256 = sha256,
+            offline = offline,
+            vt = vt,
+            deepScanEnabled = shieldSettings.deepScanEnabled,
+            fileSizeBytes = sourceFile.length(),
+        )
+        when (verdict) {
+            is ShieldVerdict.Clean -> appendLog(mine, "> shield verdict: PASS — proceeding with zero-trust install (no -g flag)")
+            is ShieldVerdict.Warning -> appendLog(mine, "> shield verdict: BLOCKED (${verdict.reasons.joinToString(", ") { it.name }}) — installation aborted")
+        }
+        return verdict
+    }
+
+    private fun shieldBlockedStatus(label: String, verdict: ShieldVerdict.Warning, logs: List<String>): InstallStatus {
+        val primaryReasonRes = when (verdict.reasons.firstOrNull()) {
+            ShieldWarningReason.MalwareDetected -> R.string.shield_warn_malware_short
+            ShieldWarningReason.UnsignedPackage -> R.string.shield_warn_unsigned
+            ShieldWarningReason.DebugOrTestCertificate -> R.string.shield_warn_debug_cert
+            ShieldWarningReason.SignatureMismatch -> R.string.shield_warn_signature
+            ShieldWarningReason.VersionDowngrade -> R.string.shield_warn_downgrade
+            null -> R.string.shield_blocked_generic
+        }
+        return InstallStatus(
+            working = false,
+            ok = false,
+            name = label,
+            percent = 100,
+            phase = InstallPhase.Done,
+            reason = primaryReasonRes,
+            shieldVerdict = verdict,
+            shieldChecking = false,
+            logs = logs,
+        )
+    }
+
+    /**
+     * Inspects the picked file by content (magic bytes and ZIP central directory), runs the Antivirus shield when
+     * enabled, and installs it over ADB: single APKs use the fast single-command stream, while APKS/XAPK/APKM/ZIP
+     * bundles extract into a dedicated temporary directory under external/internal cache, filter splits for the
+     * target device, and run a multi-APK session (plus OBB streaming when present). The temporary directory is
+     * always deleted in `finally`.
      */
     private suspend fun installApk(uri: Uri): InstallStatus {
         val app = getApplication<Application>()
         val resolver = app.contentResolver
         val (fileName, size) = withContext(Dispatchers.IO) { fileInfo(uri) }
         val mine = generation
+        val userInstall = installSettings.homeShortcut
         val generic = app.getString(R.string.unnamed_package)
         install = install?.copy(name = installLabel(null, fileName, generic))
         if (size != null && size <= 0) return failure(R.string.err_read_file)
@@ -441,45 +600,76 @@ class ConnectionModel(
             if (copied == null || copied <= 0L || sourceFile.length() <= 0L) {
                 return failure(R.string.err_read_file)
             }
+            appendLog(mine, "> source: ${fileName ?: uri.lastPathSegment ?: "package"} (${formatByteSize(sourceFile.length())})")
 
             val inspected = withContext(Dispatchers.IO) {
                 inspectAndExtractPackage(sourceFile, bundleDir)
             }
             if (inspected is PackageInspectResult.Invalid) {
+                appendLog(mine, "> container: INVALID ARCHIVE")
                 return failure(inspected.reasonRes)
             }
             val bundle = (inspected as PackageInspectResult.Valid).bundle
+            val isLocalDevice = connection.device?.local == true
 
             if (bundle.format == PackageFormat.SingleApk) {
                 val apkSize = sourceFile.length()
                 if (apkSize <= 0L) return failure(R.string.err_read_file)
+                appendLog(mine, "> container: SINGLE APK")
                 val pkg = withContext(Dispatchers.IO) { packageNameOfFile(sourceFile) }
+                appendLog(mine, "> package: ${pkg ?: "unknown"}")
+                if (userInstall) appendLog(mine, "> shortcut: on (the launcher adds the icon by itself on a new install; updates keep their icon)")
                 val label = installLabel(pkg, fileName, generic)
                 if (mine != generation) throw CancellationException()
                 install = install?.copy(name = label)
+                val verdict = verifyPackageWithShield(mine, app, sourceFile, bundle, pkg, isLocalDevice)
+                if (mine != generation) throw CancellationException()
+                install = install?.copy(shieldVerdict = verdict, shieldChecking = false)
+                if (verdict is ShieldVerdict.Warning) {
+                    return shieldBlockedStatus(label, verdict, install?.logs.orEmpty())
+                }
+                install = install?.copy(phase = InstallPhase.Sending, percent = 0)
+                appendLog(mine, "> adb: ${streamInstallCommand(apkSize, bypass = true, userInstall)} (0 permissions granted)")
                 fun report(sent: Long) = updateInstallProgress(mine, sent, apkSize)
                 // The client's own watchdog times the stream out; a slow install must never close the whole session.
                 suspend fun attempt(bypass: Boolean): String = blocking(INSTALL_TIMEOUT_MS, disconnectOnTimeout = false) {
                     report(0)
-                    sourceFile.inputStream().use { adb.install(streamInstallCommand(apkSize, bypass), apkSize, it, ::report) }
+                    sourceFile.inputStream().use { adb.install(streamInstallCommand(apkSize, bypass, userInstall), apkSize, it, ::report) }
                 }
                 var output = attempt(bypass = true)
-                if (shouldRetryWithoutBypass(output)) output = attempt(bypass = false)
+                if (shouldRetryWithoutBypass(output)) {
+                    appendLog(mine, "> adb: retrying ${streamInstallCommand(apkSize, bypass = false, userInstall)}")
+                    output = attempt(bypass = false)
+                }
                 val result = parsePmOutput(output)
-                val status = install ?: InstallStatus(false, name = label)
+                appendLog(mine, "> pm: ${result.line.ifBlank { if (result.success) "Success" else "Failure" }}")
+                val status = install ?: InstallStatus(false, name = label, shieldVerdict = verdict, shieldChecking = false)
                 return if (result.success) status.copy(working = false, ok = true, percent = 100, phase = InstallPhase.Done)
                 else failed(status, pmFailure(result.line))
             }
 
-            // Bundle (APKS / XAPK / APKM / Split ZIP): delete sourceFile immediately so we do not hold 2x disk space,
-            // then detect package name from manifest.json / info.json or base APK.
+            // Bundle (APKS / XAPK / APKM / Split ZIP): detect package name from manifest.json / info.json or base APK,
+            // run shield check, then delete sourceFile immediately so we do not hold 2x disk space during streaming.
+            appendLog(mine, "> container: ${bundle.format.name.uppercase(java.util.Locale.US)} (${bundle.apks.size} apk splits, ${bundle.obbs.size} obb files)")
             val pkg = withContext(Dispatchers.IO) {
-                runCatching { sourceFile.delete() }
                 bundle.packageName ?: bundle.findBaseApk()?.file?.let(::packageNameOfFile)
             }
+            appendLog(mine, "> package: ${pkg ?: "unknown"}")
+            if (userInstall) appendLog(mine, "> shortcut: on (the launcher adds the icon by itself on a new install; updates keep their icon)")
             val label = installLabel(pkg, fileName, generic)
             if (mine != generation) throw CancellationException()
             install = install?.copy(name = label)
+            val verdict = verifyPackageWithShield(mine, app, sourceFile, bundle, pkg, isLocalDevice)
+            if (mine != generation) throw CancellationException()
+            install = install?.copy(shieldVerdict = verdict, shieldChecking = false)
+            if (verdict is ShieldVerdict.Warning) {
+                return shieldBlockedStatus(label, verdict, install?.logs.orEmpty())
+            }
+            withContext(Dispatchers.IO) {
+                runCatching { sourceFile.delete() }
+            }
+            if (mine != generation) throw CancellationException()
+            install = install?.copy(phase = InstallPhase.Sending, percent = 0)
 
             val localAbis = Build.SUPPORTED_ABIS.toList()
             val localDpi = app.resources.displayMetrics.densityDpi
@@ -487,27 +677,36 @@ class ConnectionModel(
 
             val outcome = blocking(INSTALL_TIMEOUT_MS, disconnectOnTimeout = false) {
                 val deviceSpec = queryDeviceSpec(adb, localAbis, localDpi, localLang)
+                postLog(mine, "> target spec: abis=${deviceSpec.abis.joinToString(",")}, dpi=${deviceSpec.densityDpi ?: "auto"}, langs=${deviceSpec.languages.joinToString(",")}")
                 when (val filtered = filterSplits(bundle.apks, deviceSpec, bundle.baseApkName, pkg)) {
-                    is SplitFilterResult.IncompatibleAbi -> BundleOutcome.FailedReason(filtered.reasonRes)
+                    is SplitFilterResult.IncompatibleAbi -> {
+                        postLog(mine, "> split filter: ABORT — no matching ABI split for target device")
+                        BundleOutcome.FailedReason(filtered.reasonRes)
+                    }
                     is SplitFilterResult.Selected -> {
+                        postLog(mine, "> split filter: selected ${filtered.splits.size}/${bundle.apks.size} splits (${filtered.splits.joinToString(", ") { it.name }})")
                         val result = installBundleSession(
                             adb = adb,
                             splits = filtered.splits,
                             obbs = bundle.obbs,
                             packageName = pkg,
                             onProgress = { sent, total -> updateInstallProgress(mine, sent, total) },
+                            onLog = { line -> postLog(mine, line) },
+                            userInstall = userInstall,
                         )
                         BundleOutcome.Pm(result)
                     }
                 }
             }
 
-            val status = install ?: InstallStatus(false, name = label)
+            val status = install ?: InstallStatus(false, name = label, shieldVerdict = verdict, shieldChecking = false)
             return when (outcome) {
                 is BundleOutcome.FailedReason -> failed(status, InstallFailure(outcome.reasonRes, null))
                 is BundleOutcome.Pm -> {
-                    if (outcome.result.success) status.copy(working = false, ok = true, percent = 100, phase = InstallPhase.Done)
-                    else failed(status, pmFailure(outcome.result.line))
+                    appendLog(mine, "> pm: ${outcome.result.line.ifBlank { if (outcome.result.success) "Success" else "Failure" }}")
+                    val latestStatus = install ?: status
+                    if (outcome.result.success) latestStatus.copy(working = false, ok = true, percent = 100, phase = InstallPhase.Done)
+                    else failed(latestStatus, pmFailure(outcome.result.line))
                 }
             }
         } finally {

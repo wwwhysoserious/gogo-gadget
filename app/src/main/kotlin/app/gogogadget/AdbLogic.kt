@@ -209,9 +209,13 @@ fun shouldRetryWithoutBypass(output: String): Boolean {
     return "unknown option" in o || "unknown argument" in o || ("bypass-low-target-sdk-block" in o && "error" in o)
 }
 
+/** PackageManager.INSTALL_REASON_USER: with it, a new install makes the launcher add the app icon to the home screen. */
+const val InstallReasonUser = 4
+
 /** Streams an APK of [size] bytes from stdin, so nothing has to be readable on the device. */
-fun streamInstallCommand(size: Long, bypass: Boolean): String =
-    "cmd package install -S $size -r -d${if (bypass) " --bypass-low-target-sdk-block" else ""}"
+fun streamInstallCommand(size: Long, bypass: Boolean, userInstall: Boolean = false): String =
+    "cmd package install -S $size -r -d${if (bypass) " --bypass-low-target-sdk-block" else ""}" +
+        if (userInstall) " --install-reason $InstallReasonUser" else ""
 
 /** Where the in-app pairing form for another device stands, from the typed code and the pairing port (null until mDNS sees the dialog). */
 enum class PairingStep { EnterCode, WaitingForDialog, Submit }

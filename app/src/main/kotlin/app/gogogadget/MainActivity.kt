@@ -116,6 +116,7 @@ class MainActivity : ComponentActivity() {
             GoGoTheme(palette) {
                 var tab by rememberSaveable { mutableStateOf(Tab.Install) }
                 var themeOpen by rememberSaveable { mutableStateOf(false) }
+                var vtKeyOpen by rememberSaveable { mutableStateOf(false) }
                 var infoOpen by rememberSaveable { mutableStateOf(false) }
                 var devicesOpen by rememberSaveable { mutableStateOf(false) }
                 val connection = model.connection
@@ -133,11 +134,13 @@ class MainActivity : ComponentActivity() {
                     model.scanForPicker(devicesOpen)
                     onDispose { model.scanForPicker(false) }
                 }
-                // Back closes the info balloon, then the device list, then the theme picker, then returns to Install.
+                // Back closes the info balloon, then the device list, then the Settings sub-screens, then returns to Install.
                 BackHandler(infoOpen || devicesOpen || tab != Tab.Install) {
                     if (infoOpen) infoOpen = false
                     else if (devicesOpen) devicesOpen = false
-                    else if (tab == Tab.Settings && themeOpen) themeOpen = false else tab = Tab.Install
+                    else if (tab == Tab.Settings && themeOpen) themeOpen = false
+                    else if (tab == Tab.Settings && vtKeyOpen) vtKeyOpen = false
+                    else tab = Tab.Install
                 }
                 Column(Modifier.fillMaxSize().background(Color(palette.background)).windowInsetsPadding(WindowInsets.safeDrawing)) {
                     Box(Modifier.weight(1f).fillMaxWidth()) {
@@ -203,10 +206,12 @@ class MainActivity : ComponentActivity() {
                                     setting = it
                                     prefs.edit().putString(KEY_THEME, it.name).apply()
                                 },
+                                vtKeyOpen = vtKeyOpen,
+                                onVtKeyOpen = { vtKeyOpen = it },
                             )
                         }
                     }
-                    BottomBar(palette, tab) { tab = it; themeOpen = false }
+                    BottomBar(palette, tab) { tab = it; themeOpen = false; vtKeyOpen = false }
                 }
             }
         }

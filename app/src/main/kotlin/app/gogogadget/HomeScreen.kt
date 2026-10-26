@@ -5,6 +5,7 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
@@ -33,6 +34,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -46,6 +48,8 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.RectangleShape
@@ -57,6 +61,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
@@ -76,8 +81,8 @@ import kotlinx.coroutines.delay
 import kotlin.math.roundToInt
 
 val Margin = 24.dp
-private val PanelHeight = 260.dp
-private val NodeSize = 72.dp
+private val PanelHeight = 192.dp
+private val NodeSize = 64.dp
 private val ProgressInset = 4.dp
 private const val ResultHoldMs = 4_000L
 
@@ -107,90 +112,43 @@ fun HomeScreen(
     }
     val density = LocalDensity.current
     var bannerHeight by rememberSaveable { mutableIntStateOf(0) }
-    val accent = Color(palette.accent)
-    val button = buttonFor(connection.state)
+    val terminalMode = install?.logs?.isNotEmpty() == true
+    val controls: @Composable () -> Unit = {
+        HomeControls(
+            palette, connection, install, infoOpen, pairPort, onCode, onRepost, notificationsOk, onAllowNotifications,
+            onOpenDeveloperOptions, onInfoToggle, onButton, fixedPanel = terminalMode,
+        )
+    }
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val viewport = maxHeight
-        Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).heightIn(min = viewport)) {
-            Column(Modifier.onSizeChanged { bannerHeight = it.height }) {
-                Image(
-                    painter = painterResource(banner),
-                    contentDescription = stringResource(R.string.banner_description),
-                    contentScale = ContentScale.FillWidth,
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = Margin, vertical = 48.dp),
-                )
-                Divider(palette)
+        if (terminalMode && install != null) {
+            // Fixed page: only the terminal scrolls, and it takes all the height left under the install summary.
+            Column(Modifier.fillMaxSize()) {
+                HomeBanner(palette, banner)
+                Column(Modifier.fillMaxWidth().weight(1f).padding(horizontal = Margin)) {
+                    controls()
+                    Box(Modifier.fillMaxWidth().padding(top = 12.dp)) { InstallSummary(palette, install) }
+                    Spacer(Modifier.height(10.dp))
+                    TerminalLogBox(palette, install.logs, Modifier.weight(1f).heightIn(min = 96.dp))
+                }
             }
-            // The composition is centred in the space left under the banner.
-            Box(
-                Modifier.fillMaxWidth().heightIn(min = viewport - with(density) { bannerHeight.toDp() }),
-                contentAlignment = Alignment.Center,
-            ) {
-                Column(Modifier.fillMaxWidth().padding(horizontal = Margin)) {
-                    Row(Modifier.fillMaxWidth().heightIn(min = 48.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Text(
-                            stringResource(R.string.wireless_debugging),
-                            style = MaterialTheme.typography.titleMedium,
-                            color = Color(palette.text),
-                            maxLines = 2,
-                            modifier = Modifier.weight(1f).semantics { heading() },
-                        )
-                        // 48 dp touch target around a 24 dp visible square, flush with the right margin.
-                        val infoLabel = stringResource(R.string.info_button)
-                        val infoState = stringResource(if (infoOpen) R.string.info_expanded else R.string.info_collapsed)
-                        Box(
-                            Modifier.size(48.dp).offset(x = 12.dp)
-                                .clickable(role = Role.Button, onClick = onInfoToggle)
-                                .semantics { contentDescription = infoLabel; stateDescription = infoState },
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            Box(
-                                Modifier.size(24.dp).border(1.dp, accent).clearAndSetSemantics {},
-                                contentAlignment = Alignment.Center,
-                            ) {
-                                Text(stringResource(R.string.info_glyph), style = MaterialTheme.typography.labelSmall, color = accent)
+        } else {
+            Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).heightIn(min = viewport)) {
+                HomeBanner(palette, banner, Modifier.onSizeChanged { bannerHeight = it.height })
+                // The composition is centred in the space left under the banner.
+                Box(
+                    Modifier.fillMaxWidth().heightIn(min = viewport - with(density) { bannerHeight.toDp() }),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Column(Modifier.fillMaxWidth().padding(horizontal = Margin)) {
+                        controls()
+                        // Minimum-height slot so the button does not move when the install block appears; wraps if needed.
+                        Box(Modifier.fillMaxWidth().heightIn(min = 48.dp).padding(top = 12.dp)) {
+                            when {
+                                install != null -> InstallSummary(palette, install)
+                                connection.state == ConnectionState.Connected ->
+                                    Text(stringResource(R.string.formats), style = MaterialTheme.typography.bodyMedium, color = Color(palette.secondary))
                             }
-                        }
-                    }
-                    // The balloon takes the panel's place and is exactly as tall as its content.
-                    if (infoOpen) {
-                        InfoBalloon(palette, infoFor(connection), onInfoToggle)
-                    } else {
-                        ConnectionPanel(
-                            palette, connection, pairPort, onCode, onRepost, notificationsOk, onAllowNotifications,
-                            onOpenDeveloperOptions,
-                            onOpenPicker = { onButton(ButtonAction.ChooseDevice) },
-                            modifier = Modifier.heightIn(min = PanelHeight),
-                        )
-                    }
-                    Spacer(Modifier.height(16.dp))
-                    // The button shows the install progress while it runs and holds the result for ~4 s (or until tapped).
-                    var holding by remember { mutableStateOf(false) }
-                    val working = install?.working == true
-                    LaunchedEffect(working) {
-                        if (working) holding = true
-                        else if (holding) {
-                            delay(ResultHoldMs)
-                            holding = false
-                        }
-                    }
-                    if ((working || holding) && install != null) {
-                        ProgressButton(palette, install, onDismiss = { holding = false })
-                    } else {
-                        Button(
-                            onClick = { onButton(button.action) },
-                            modifier = Modifier.fillMaxWidth().height(56.dp),
-                            shape = RectangleShape,
-                            colors = ButtonDefaults.buttonColors(),
-                            elevation = null,
-                        ) { Text(stringResource(button.label), style = MaterialTheme.typography.labelLarge) }
-                    }
-                    // Minimum-height slot so the button does not move when the install block appears; wraps if needed.
-                    Box(Modifier.fillMaxWidth().heightIn(min = 48.dp).padding(top = 12.dp)) {
-                        when {
-                            install != null -> InstallBlock(palette, install)
-                            connection.state == ConnectionState.Connected ->
-                                Text(stringResource(R.string.formats), style = MaterialTheme.typography.bodyMedium, color = Color(palette.secondary))
                         }
                     }
                 }
@@ -199,9 +157,107 @@ fun HomeScreen(
     }
 }
 
-/** Package name (or file name) with its result mark, plus the plain failure reason and the collapsible raw diagnostic line. */
 @Composable
-private fun InstallBlock(palette: Palette, install: InstallStatus) {
+private fun HomeBanner(palette: Palette, banner: Int, modifier: Modifier = Modifier) {
+    Column(modifier) {
+        Image(
+            painter = painterResource(banner),
+            contentDescription = stringResource(R.string.banner_description),
+            contentScale = ContentScale.FillWidth,
+            modifier = Modifier.fillMaxWidth().padding(horizontal = Margin, vertical = 24.dp),
+        )
+        Divider(palette)
+    }
+}
+
+/** Title row, connection panel (or info balloon) and the main button, shared by both Home layouts. */
+@Composable
+private fun HomeControls(
+    palette: Palette,
+    connection: Connection,
+    install: InstallStatus?,
+    infoOpen: Boolean,
+    pairPort: Int?,
+    onCode: (String) -> Unit,
+    onRepost: () -> Unit,
+    notificationsOk: Boolean,
+    onAllowNotifications: () -> Unit,
+    onOpenDeveloperOptions: () -> Unit,
+    onInfoToggle: () -> Unit,
+    onButton: (ButtonAction) -> Unit,
+    fixedPanel: Boolean,
+) {
+    val accent = Color(palette.accent)
+    val button = buttonFor(connection.state)
+    Column(Modifier.fillMaxWidth()) {
+        Row(Modifier.fillMaxWidth().heightIn(min = 48.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                stringResource(R.string.wireless_debugging),
+                style = MaterialTheme.typography.titleMedium,
+                color = Color(palette.text),
+                maxLines = 2,
+                modifier = Modifier.weight(1f).semantics { heading() },
+            )
+            // 48 dp touch target around a 24 dp visible square, flush with the right margin.
+            val infoLabel = stringResource(R.string.info_button)
+            val infoState = stringResource(if (infoOpen) R.string.info_expanded else R.string.info_collapsed)
+            Box(
+                Modifier.size(48.dp).offset(x = 12.dp)
+                    .clickable(role = Role.Button, onClick = onInfoToggle)
+                    .semantics { contentDescription = infoLabel; stateDescription = infoState },
+                contentAlignment = Alignment.Center,
+            ) {
+                Box(
+                    Modifier.size(24.dp).border(1.dp, accent).clearAndSetSemantics {},
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(stringResource(R.string.info_glyph), style = MaterialTheme.typography.labelSmall, color = accent)
+                }
+            }
+        }
+        // The balloon takes the panel's place and is exactly as tall as its content.
+        if (infoOpen) {
+            InfoBalloon(palette, infoFor(connection), onInfoToggle)
+        } else {
+            ConnectionPanel(
+                palette, connection, pairPort, onCode, onRepost, notificationsOk, onAllowNotifications,
+                onOpenDeveloperOptions,
+                onOpenPicker = { onButton(ButtonAction.ChooseDevice) },
+                // Terminal mode is measured with a bounded height: the panel's weighted text area would fill it all.
+                modifier = if (fixedPanel) Modifier.height(PanelHeight) else Modifier.heightIn(min = PanelHeight),
+            )
+        }
+        Spacer(Modifier.height(12.dp))
+        // The button shows the install progress while it runs and holds the result for ~4 s (or until tapped).
+        var holding by remember { mutableStateOf(false) }
+        val working = install?.working == true
+        LaunchedEffect(working) {
+            if (working) holding = true
+            else if (holding) {
+                delay(ResultHoldMs)
+                holding = false
+            }
+        }
+        if ((working || holding) && install != null) {
+            ProgressButton(palette, install, onDismiss = { holding = false })
+        } else {
+            Button(
+                onClick = { onButton(button.action) },
+                modifier = Modifier.fillMaxWidth().height(56.dp),
+                shape = RectangleShape,
+                colors = ButtonDefaults.buttonColors(),
+                elevation = null,
+            ) { Text(stringResource(button.label), style = MaterialTheme.typography.labelLarge) }
+        }
+    }
+}
+
+/** Package name (or file name) with its result mark, persistent Security Shield status, and any failure reason. */
+@Composable
+private fun InstallSummary(
+    palette: Palette,
+    install: InstallStatus,
+) {
     Column(Modifier.fillMaxWidth()) {
         if (install.name.isNotEmpty()) {
             val mark = packageResultMark(install.working, install.ok)
@@ -244,7 +300,21 @@ private fun InstallBlock(palette: Palette, install: InstallStatus) {
                 )
             }
         }
-        if (!install.working && !install.ok) {
+        val showShield = install.shieldChecking || install.shieldVerdict != null
+        if (showShield) {
+            if (install.name.isNotEmpty()) {
+                Spacer(Modifier.height(6.dp))
+            }
+            ShieldStatusBlock(
+                palette = palette,
+                checking = install.shieldChecking,
+                verdict = install.shieldVerdict,
+            )
+        }
+        if (!install.working && !install.ok && install.shieldVerdict !is ShieldVerdict.Warning) {
+            if (showShield || install.name.isNotEmpty()) {
+                Spacer(Modifier.height(6.dp))
+            }
             // Only the plain sentence on the main screen; the raw line stays behind "Details" (diagnostic until v1.0).
             Text(
                 stringResource(install.reason ?: R.string.reason_unknown),
@@ -266,6 +336,205 @@ private fun InstallBlock(palette: Palette, install: InstallStatus) {
     }
 }
 
+/** True when the terminal should keep following the newest line: the view is at, or within [thresholdPx] of, the bottom. */
+internal fun shouldFollowTail(value: Int, maxValue: Int, thresholdPx: Int): Boolean =
+    maxValue - value <= thresholdPx
+
+/** The log box: the header stays fixed, the lines scroll and follow the tail unless the user scrolled up to read. */
+@Composable
+private fun TerminalLogBox(
+    palette: Palette,
+    logs: List<String>,
+    modifier: Modifier = Modifier,
+) {
+    val scrollState = rememberScrollState()
+    val thresholdPx = with(LocalDensity.current) { 24.dp.roundToPx() }
+    var atBottom by remember { mutableStateOf(true) }
+    var lastSize by remember { mutableIntStateOf(logs.size) }
+    // Only the user (or the jump below) changes the scroll value; new content changes maxValue, so this keeps the intent.
+    LaunchedEffect(scrollState) {
+        snapshotFlow { scrollState.value }.collect { atBottom = shouldFollowTail(it, scrollState.maxValue, thresholdPx) }
+    }
+    LaunchedEffect(logs.size) {
+        if (logs.size < lastSize) atBottom = true
+        lastSize = logs.size
+    }
+    LaunchedEffect(scrollState) {
+        snapshotFlow { scrollState.maxValue }.collect { if (atBottom) scrollState.scrollTo(it) }
+    }
+    Column(
+        modifier.fillMaxWidth()
+            .background(Color(palette.surface))
+            .border(1.dp, Color(palette.divider))
+            .padding(12.dp),
+    ) {
+        Text(
+            stringResource(R.string.terminal_header),
+            style = MaterialTheme.typography.labelSmall,
+            fontFamily = FontFamily.Monospace,
+            color = Color(palette.secondary),
+        )
+        Spacer(Modifier.height(6.dp))
+        Divider(palette)
+        Spacer(Modifier.height(6.dp))
+        Column(Modifier.weight(1f).fillMaxWidth().verticalScroll(scrollState)) {
+        for ((index, line) in logs.withIndex()) {
+            val lineColor = when {
+                line.contains("BLOCKED") ||
+                    line.contains("ABORT") ||
+                    line.contains("UNSIGNED") ||
+                    line.contains("UNTRUSTED") ||
+                    line.contains("MISMATCH") ||
+                    line.contains("Failure") ||
+                    line.startsWith("> error:") -> Color(palette.error)
+                line.contains("PASS") || line.contains("pm: Success") -> Color(palette.success)
+                else -> Color(palette.text)
+            }
+            Text(
+                text = String.format(java.util.Locale.US, "%02d %s", index + 1, line),
+                style = MaterialTheme.typography.bodySmall,
+                fontFamily = FontFamily.Monospace,
+                color = lineColor,
+                modifier = Modifier.padding(vertical = 1.dp),
+            )
+        }
+        }
+    }
+}
+
+@Composable
+internal fun SecurityShieldIcon(
+    color: Color,
+    modifier: Modifier = Modifier.size(18.dp),
+) {
+    Canvas(modifier) {
+        val sx = size.width / 24f
+        val sy = size.height / 24f
+        val strokeWidth = (size.minDimension * (2.2f / 24f)).coerceAtLeast(1.5.dp.toPx())
+        val shieldPath = Path().apply {
+            moveTo(12f * sx, 2f * sy)
+            lineTo(20f * sx, 5.5f * sy)
+            lineTo(20f * sx, 11.5f * sy)
+            lineTo(18.6f * sx, 15.6f * sy)
+            lineTo(15.8f * sx, 19.2f * sy)
+            lineTo(12f * sx, 22f * sy)
+            lineTo(8.2f * sx, 19.2f * sy)
+            lineTo(5.4f * sx, 15.6f * sy)
+            lineTo(4f * sx, 11.5f * sy)
+            lineTo(4f * sx, 5.5f * sy)
+            close()
+        }
+        drawPath(shieldPath, color = color, style = Stroke(width = strokeWidth))
+        val checkPath = Path().apply {
+            moveTo(8.2f * sx, 12.2f * sy)
+            lineTo(11.0f * sx, 15.0f * sy)
+            lineTo(16.2f * sx, 9.2f * sy)
+        }
+        drawPath(checkPath, color = color, style = Stroke(width = strokeWidth))
+    }
+}
+
+@Composable
+private fun ShieldStatusBlock(
+    palette: Palette,
+    checking: Boolean,
+    verdict: ShieldVerdict?,
+) {
+    when {
+        checking -> {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                SecurityShieldIcon(color = Color(palette.accent), modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    stringResource(R.string.shield_status_checking),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Color(palette.secondary),
+                )
+            }
+        }
+        verdict is ShieldVerdict.Clean -> {
+            Column(Modifier.fillMaxWidth()) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    SecurityShieldIcon(color = Color(palette.success), modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(8.dp))
+                    val cleanText = when (shieldStatusKind(verdict.vtSummary)) {
+                        ShieldStatusKind.VerifiedWithVt -> stringResource(R.string.shield_status_clean_vt, verdict.vtSummary.orEmpty())
+                        ShieldStatusKind.OfflineNoKey -> stringResource(R.string.shield_status_offline_no_key)
+                        ShieldStatusKind.OfflineVtIssue -> stringResource(R.string.shield_status_offline_vt, verdict.vtSummary.orEmpty())
+                    }
+                    Text(
+                        cleanText,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = Color(palette.success),
+                    )
+                }
+                Text(
+                    stringResource(R.string.shield_sha256, truncateSha256(verdict.sha256)),
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = FontFamily.Monospace,
+                    color = Color(palette.secondary),
+                    modifier = Modifier.padding(top = 2.dp),
+                )
+                Text(
+                    stringResource(R.string.shield_permissions_summary, verdict.offline?.allPermissions?.size ?: 0),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color(palette.secondary),
+                    modifier = Modifier.padding(top = 2.dp),
+                )
+            }
+        }
+        verdict is ShieldVerdict.Warning -> {
+            val errorColor = Color(palette.error)
+            val textColor = Color(palette.text)
+            Column(
+                Modifier.fillMaxWidth()
+                    .background(Color(palette.surface))
+                    .border(1.dp, errorColor)
+                    .padding(12.dp),
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    SecurityShieldIcon(color = errorColor, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        stringResource(R.string.shield_status_blocked),
+                        style = MaterialTheme.typography.labelLarge,
+                        color = errorColor,
+                        modifier = Modifier.semantics { heading() },
+                    )
+                }
+                Spacer(Modifier.height(6.dp))
+                for (reason in verdict.reasons) {
+                    val message = when (reason) {
+                        ShieldWarningReason.MalwareDetected ->
+                            stringResource(R.string.shield_warn_malware, verdict.vtMalicious, verdict.vtTotal.coerceAtLeast(verdict.vtMalicious))
+                        ShieldWarningReason.UnsignedPackage ->
+                            stringResource(R.string.shield_warn_unsigned)
+                        ShieldWarningReason.DebugOrTestCertificate ->
+                            stringResource(R.string.shield_warn_debug_cert)
+                        ShieldWarningReason.SignatureMismatch ->
+                            stringResource(R.string.shield_warn_signature)
+                        ShieldWarningReason.VersionDowngrade ->
+                            stringResource(R.string.shield_warn_downgrade)
+                    }
+                    Text(
+                        message,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = textColor,
+                        modifier = Modifier.padding(top = 2.dp),
+                    )
+                }
+                Text(
+                    stringResource(R.string.shield_sha256, truncateSha256(verdict.sha256)),
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = FontFamily.Monospace,
+                    color = Color(palette.secondary),
+                    modifier = Modifier.padding(top = 6.dp),
+                )
+            }
+        }
+    }
+}
+
 /**
  * The main button while an install runs and for ~4 s after: a flat track with ONE solid fill (success colour, error
  * colour after a failure). While running, its width is [fillWidthPx] of the inner width and the running caption is
@@ -281,6 +550,7 @@ private fun ProgressButton(palette: Palette, install: InstallStatus, onDismiss: 
     val caption = when {
         !install.working && install.ok -> stringResource(R.string.status_success)
         !install.working -> stringResource(R.string.status_not_installed)
+        install.phase == InstallPhase.Checking -> stringResource(R.string.phase_checking)
         install.phase == InstallPhase.Installing -> stringResource(R.string.phase_installing)
         else -> stringResource(R.string.phase_sending, install.percent)
     }
@@ -301,8 +571,15 @@ private fun ProgressButton(palette: Palette, install: InstallStatus, onDismiss: 
         Canvas(Modifier.fillMaxSize()) {
             drawRect(fill, Offset.Zero, androidx.compose.ui.geometry.Size(fillWidthPx(size.width.roundToInt(), fillPercent).toFloat(), size.height))
         }
+        val checking = install.working && install.phase == InstallPhase.Checking
         Box(Modifier.fillMaxSize().clearAndSetSemantics {}, contentAlignment = Alignment.Center) {
-            Text(caption, style = textStyle, color = Color(palette.text), maxLines = 1)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (checking) {
+                    SecurityShieldIcon(color = Color(palette.text), modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(6.dp))
+                }
+                Text(caption, style = textStyle, color = Color(palette.text), maxLines = 1)
+            }
         }
         Box(
             Modifier.fillMaxSize().clearAndSetSemantics {}.drawWithContent {
@@ -311,7 +588,13 @@ private fun ProgressButton(palette: Palette, install: InstallStatus, onDismiss: 
             },
             contentAlignment = Alignment.Center,
         ) {
-            Text(caption, style = textStyle, color = onFill, maxLines = 1)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (checking) {
+                    SecurityShieldIcon(color = onFill, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(6.dp))
+                }
+                Text(caption, style = textStyle, color = onFill, maxLines = 1)
+            }
         }
     }
 }
@@ -338,7 +621,7 @@ private fun ConnectionPanel(
     Column(
         modifier.fillMaxWidth().background(Color(palette.surface))
             .then(if (tappable) Modifier.clickable(role = Role.Button, onClickLabel = pickLabel, onClick = onOpenPicker) else Modifier)
-            .padding(16.dp),
+            .padding(12.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         Row(Modifier.fillMaxWidth()) {
@@ -572,6 +855,7 @@ fun Field(
     mono: Boolean = false,
     imeAction: ImeAction = ImeAction.Default,
     onDone: (() -> Unit)? = null,
+    visualTransformation: VisualTransformation = VisualTransformation.None,
     modifier: Modifier = Modifier,
 ) {
     val label = stringResource(hint)
@@ -585,6 +869,7 @@ fun Field(
         singleLine = true,
         textStyle = style,
         cursorBrush = SolidColor(Color(palette.accent)),
+        visualTransformation = visualTransformation,
         keyboardOptions = KeyboardOptions(keyboardType = keyboard, autoCorrectEnabled = false, imeAction = imeAction),
         keyboardActions = KeyboardActions(onDone = onDone?.let { go -> { go() } }),
         modifier = modifier.fillMaxWidth().height(48.dp).border(1.dp, Color(palette.text)).semantics { contentDescription = label },
@@ -606,18 +891,21 @@ private fun Node(palette: Palette, label: Int, glyph: Glyph) {
         Canvas(Modifier.size(NodeSize).background(Color(palette.background)).border(1.dp, text)) {
             val w = 2.dp.toPx()
             val c = Offset(size.width / 2, size.height / 2)
+            // The glyph was drawn for a 72 dp node; scale every measure with the canvas.
+            val k = size.width / 72.dp.toPx()
+            fun u(v: Float) = v.dp.toPx() * k
             when (glyph) {
                 Glyph.Phone -> {
-                    val half = Offset(11.dp.toPx(), 18.dp.toPx())
+                    val half = Offset(u(11f), u(18f))
                     drawRect(text, c - half, androidx.compose.ui.geometry.Size(half.x * 2, half.y * 2), style = androidx.compose.ui.graphics.drawscope.Stroke(w))
-                    drawLine(text, Offset(c.x - 3.dp.toPx(), c.y - 12.dp.toPx()), Offset(c.x + 3.dp.toPx(), c.y - 12.dp.toPx()), w)
-                    drawRect(text, Offset(c.x - 1.5.dp.toPx(), c.y + 10.dp.toPx()), androidx.compose.ui.geometry.Size(3.dp.toPx(), 3.dp.toPx()))
+                    drawLine(text, Offset(c.x - u(3f), c.y - u(12f)), Offset(c.x + u(3f), c.y - u(12f)), w)
+                    drawRect(text, Offset(c.x - u(1.5f), c.y + u(10f)), androidx.compose.ui.geometry.Size(u(3f), u(3f)))
                 }
                 Glyph.Terminal -> {
-                    val x = c.x - 10.dp.toPx()
-                    drawLine(text, Offset(x, c.y - 9.dp.toPx()), Offset(x + 9.dp.toPx(), c.y), w)
-                    drawLine(text, Offset(x + 9.dp.toPx(), c.y), Offset(x, c.y + 9.dp.toPx()), w)
-                    drawLine(text, Offset(c.x + 2.dp.toPx(), c.y + 9.dp.toPx()), Offset(c.x + 14.dp.toPx(), c.y + 9.dp.toPx()), w)
+                    val x = c.x - u(10f)
+                    drawLine(text, Offset(x, c.y - u(9f)), Offset(x + u(9f), c.y), w)
+                    drawLine(text, Offset(x + u(9f), c.y), Offset(x, c.y + u(9f)), w)
+                    drawLine(text, Offset(c.x + u(2f), c.y + u(9f)), Offset(c.x + u(14f), c.y + u(9f)), w)
                 }
             }
         }
