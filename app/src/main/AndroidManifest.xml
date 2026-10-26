@@ -2,6 +2,23 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
+    <!-- ADB sockets to this device or to a device on the local network. The app never contacts the internet. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- Network devices are found by mDNS (NsdManager); Android drops multicast packets unless the app holds a MulticastLock, which needs this normal permission. -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+
+    <!-- "This device" pairing: a short foreground service searches for this phone's pairing dialog and keeps the "Enter pairing code" notification alive while the dialog is on screen. shortService needs no extra permission. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+
+    <!-- Android 13+: show that notification (type the code there). Optional: the in-app code field always works. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Injected by the manifest merger because the ADB library declares minSdk 1; the app needs none of them. -->
+    <uses-permission android:name="android.permission.READ_PHONE_STATE" tools:node="remove" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" tools:node="remove" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" tools:node="remove" />
+
     <application
         android:allowBackup="false"
         android:enableOnBackInvokedCallback="true"
@@ -15,8 +32,15 @@
             android:name="androidx.profileinstaller.ProfileInstallReceiver"
             tools:node="remove" />
 
+        <!-- Pairs with this phone's own Wireless debugging from a notification. Never exported: only our own PendingIntents reach it. -->
+        <service
+            android:name=".PairingService"
+            android:exported="false"
+            android:foregroundServiceType="shortService" />
+
         <activity
             android:name=".MainActivity"
+            android:windowSoftInputMode="adjustResize"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

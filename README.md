@@ -7,7 +7,8 @@ A free and open-source APK installer for Android. It installs directly on the de
 ## Features (v1.0)
 
 - Standalone local ADB (Wireless Debugging)
-- Zero-Trust: no permissions granted by default
+- Zero-Trust: only the permissions it needs, each documented in [docs/ADB-LIBRARY.md](docs/ADB-LIBRARY.md) (INTERNET, CHANGE_WIFI_MULTICAST_STATE for mDNS, FOREGROUND_SERVICE and POST_NOTIFICATIONS for the pairing notification)
+- Two ways to connect: this phone (pair once, type the code in a notification) and other devices on the Wi-Fi (connect and tap Allow on that device)
 - SHA-256 antivirus shield (VirusTotal/Koodous) with optional Deep Scan
 - Automatic backup and rollback before updating
 - Detached from the Play Store by default
@@ -21,6 +22,13 @@ Requires **JDK 17**. Point `JAVA_HOME` at a JDK 17 before running Gradle:
 ```
 JAVA_HOME=/path/to/jdk-17 ./gradlew assembleDebug testDebugUnitTest
 ```
+
+## ADB library
+
+ADB pairing and connection use [libadb-android](https://github.com/MuntashirAkon/libadb-android)
+(GPL-3.0-or-later or Apache-2.0; used here under GPL-3.0-or-later), which depends on spake2-java (LGPL-3.0) and
+BouncyCastle. Details, checksums and the permission list are in [docs/ADB-LIBRARY.md](docs/ADB-LIBRARY.md); what
+could not be verified without a device is in [docs/SPIKE-phase2.md](docs/SPIKE-phase2.md).
 
 ## Support
 
