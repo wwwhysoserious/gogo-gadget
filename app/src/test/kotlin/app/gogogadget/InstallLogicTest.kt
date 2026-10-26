@@ -165,6 +165,8 @@ class InstallLogicTest {
     @Test fun unidentifiedFailureIsUnknown() {
         assertEquals(R.string.reason_unknown, transferFailure(IOException("boom"), "IOException: boom").reason)
         assertEquals(R.string.reason_unknown, transferFailure(IllegalStateException("x"), null).reason)
+        assertEquals(R.string.reason_unknown, transferFailure(OutOfMemoryError("heap"), "OutOfMemoryError: heap").reason)
+        assertEquals(R.string.reason_unknown, transferFailure(java.util.zip.ZipError("bad central dir"), "ZipError").reason)
         assertEquals("IOException: boom", transferFailure(IOException("boom"), "IOException: boom").raw)
     }
 
@@ -209,5 +211,14 @@ class InstallLogicTest {
         assertEquals(100, barFillPercent(working = false, percent = 0))
         assertEquals(100, barFillPercent(working = false, percent = 42))
         assertEquals(100, barFillPercent(working = false, percent = 100))
+    }
+
+    // ---- packageResultMark ----
+
+    @Test fun packageResultMarkIsNoneWhileWorkingAndCheckOrCrossWhenFinished() {
+        assertEquals(PackageResultMark.None, packageResultMark(working = true, ok = false))
+        assertEquals(PackageResultMark.None, packageResultMark(working = true, ok = true))
+        assertEquals(PackageResultMark.Check, packageResultMark(working = false, ok = true))
+        assertEquals(PackageResultMark.Cross, packageResultMark(working = false, ok = false))
     }
 }

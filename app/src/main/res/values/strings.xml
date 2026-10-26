@@ -2,7 +2,7 @@
 <resources>
     <string name="app_name">GoGo Gadget</string>
     <string name="banner_description">GoGo Gadget</string>
-    <string name="formats">Supported: APK · XAPK · APKM · APKS · ZIP (split APKs)</string>
+    <string name="formats">Supported: APK · APKS · XAPK · APKM · ZIP</string>
     <string name="settings">Settings</string>
     <string name="back">Back</string>
     <string name="theme">Theme</string>
@@ -85,7 +85,8 @@
     <string name="reason_storage">Not enough storage space on the device.</string>
     <string name="reason_older_sdk">This app needs a newer Android version.</string>
     <string name="reason_abis">This app is not built for this device\'s processor.</string>
-    <string name="reason_parse">This file could not be read as an app. It may be damaged or a bundle (such as XAPK).</string>
+    <string name="reason_parse">This file could not be read as an app.</string>
+    <string name="reason_not_zip_or_proprietary">This file is not a standard app package or uses an unsupported encrypted format.</string>
     <string name="reason_exists">This app is already installed.</string>
     <string name="reason_restricted">Installing apps is blocked on this device.</string>
     <string name="reason_timeout">The device did not answer in time.</string>

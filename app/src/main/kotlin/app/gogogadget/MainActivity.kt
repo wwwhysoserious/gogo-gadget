@@ -40,6 +40,7 @@ import androidx.compose.ui.graphics.Color
 
 private const val PREFS = "settings"
 private const val KEY_THEME = "theme"
+const val SUPPORTED_FORMATS = "APK · APKS · XAPK · APKM · ZIP"
 
 class MainActivity : ComponentActivity() {
     private val model: ConnectionModel by viewModels()

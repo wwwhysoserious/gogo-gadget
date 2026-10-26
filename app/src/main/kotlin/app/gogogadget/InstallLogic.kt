@@ -27,6 +27,15 @@ fun installPercent(sent: Long, total: Long, done: Boolean): Int = when {
  */
 fun barFillPercent(working: Boolean, percent: Int): Int = if (working) percent.coerceIn(0, 100) else 100
 
+/** Result mark shown next to the package name once the installation finishes. */
+enum class PackageResultMark { None, Check, Cross }
+
+fun packageResultMark(working: Boolean, ok: Boolean): PackageResultMark = when {
+    working -> PackageResultMark.None
+    ok -> PackageResultMark.Check
+    else -> PackageResultMark.Cross
+}
+
 /** What the caption inside the button says: bytes still going out, waiting for pm's answer, or finished. */
 enum class InstallPhase { Sending, Installing, Done }
 

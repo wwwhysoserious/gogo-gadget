@@ -392,8 +392,8 @@ class ConnectionModel(
                 val lost = installErrorIsConnectionLoss(adb.isConnected)
                 if (lost) connection = Connection(ConnectionState.Error, connection.device, AdbError.ConnectionLost, diagnostic(e))
                 failed(install, transferFailure(e, diagnostic(e), sessionConnected = !lost))
-            } catch (e: Exception) {
-                failed(install, transferFailure(e, diagnostic(e)))
+            } catch (t: Throwable) {
+                failed(install, transferFailure(t, diagnostic(t)))
             }
             install = result
         }
@@ -404,54 +404,129 @@ class ConnectionModel(
 
     private fun failure(res: Int) = failed(install, InstallFailure(res, null))
 
-    /** Streams the APK through the ADB connection: nothing is copied to the device. The app only makes a short-lived cache copy to read the package name. */
-    private suspend fun installApk(uri: Uri): InstallStatus {
-        val resolver = getApplication<Application>().contentResolver
-        val (fileName, size) = withContext(Dispatchers.IO) { fileInfo(uri) }
-        val mine = generation
-        val generic = getApplication<Application>().getString(R.string.unnamed_package)
-        install = install?.copy(name = installLabel(null, fileName, generic))
-        if (!isSingleApk(fileName)) return failure(R.string.err_read_file)
-        if (size == null || size <= 0) return failure(R.string.err_read_file)
-        // The name shown is the applicationId when the manifest can be read, else the file name.
-        val label = installLabel(withContext(Dispatchers.IO) { packageNameOf(uri) }, fileName, generic)
-        if (mine != generation) throw CancellationException()
-        install = install?.copy(name = label)
-        fun report(sent: Long) {
-            if (mine != generation) return
-            val state = installPhase(sent, size, answered = false)
-            install = install?.takeIf { it.working }?.copy(percent = state.percent, phase = state.phase)
+    private fun updateInstallProgress(mine: Int, sent: Long, total: Long) {
+        val state = installPhase(sent, total, answered = false)
+        viewModelScope.launch {
+            if (mine == generation) {
+                install = install?.takeIf { it.working }?.copy(percent = state.percent, phase = state.phase)
+            }
         }
-        // The client's own watchdog times the stream out; a slow install must never close the whole session.
-        suspend fun attempt(bypass: Boolean): String? = blocking(INSTALL_TIMEOUT_MS, disconnectOnTimeout = false) {
-            report(0)
-            resolver.openInputStream(uri)?.use { adb.install(streamInstallCommand(size, bypass), size, it, ::report) }
-        }
-        var output = attempt(bypass = true) ?: return failure(R.string.err_read_file)
-        if (shouldRetryWithoutBypass(output)) output = attempt(bypass = false) ?: return failure(R.string.err_read_file)
-        val result = parsePmOutput(output)
-        val status = install ?: InstallStatus(false, name = label)
-        return if (result.success) status.copy(working = false, ok = true, percent = 100, phase = InstallPhase.Done)
-        else failed(status, pmFailure(result.line))
     }
 
     /**
-     * The applicationId from the APK's manifest, read by the platform on a temporary copy in the app cache (the
-     * picked file is a content Uri); null when it cannot be read. The copy is always deleted.
+     * Inspects the picked file by content (magic bytes and ZIP central directory) and installs it over ADB:
+     * single APKs use the fast single-command stream, while APKS/XAPK/APKM/ZIP bundles extract into a dedicated
+     * temporary directory under external/internal cache, filter splits for the target device, and run a multi-APK
+     * session (plus OBB streaming when present). The temporary directory is always deleted in `finally`.
      */
-    private fun packageNameOf(uri: Uri): String? {
+    private suspend fun installApk(uri: Uri): InstallStatus {
         val app = getApplication<Application>()
-        val copy = File.createTempFile("parse", ".apk", app.cacheDir)
-        return try {
-            app.contentResolver.openInputStream(uri)?.use { input -> copy.outputStream().use { input.copyTo(it) } }
-                ?: return null
-            @Suppress("DEPRECATION")
-            app.packageManager.getPackageArchiveInfo(copy.path, 0)?.packageName
-        } catch (e: Exception) {
-            null
+        val resolver = app.contentResolver
+        val (fileName, size) = withContext(Dispatchers.IO) { fileInfo(uri) }
+        val mine = generation
+        val generic = app.getString(R.string.unnamed_package)
+        install = install?.copy(name = installLabel(null, fileName, generic))
+        if (size != null && size <= 0) return failure(R.string.err_read_file)
+
+        val baseCache = app.externalCacheDir ?: app.cacheDir
+        val bundleDir = File(baseCache, "bundle_${System.nanoTime()}")
+        try {
+            val sourceFile = File(bundleDir, "source.pkg")
+            val copied = withContext(Dispatchers.IO) {
+                bundleDir.mkdirs()
+                resolver.openInputStream(uri)?.use { input ->
+                    sourceFile.outputStream().use { output -> input.copyTo(output, 64 * 1024) }
+                }
+            }
+            if (copied == null || copied <= 0L || sourceFile.length() <= 0L) {
+                return failure(R.string.err_read_file)
+            }
+
+            val inspected = withContext(Dispatchers.IO) {
+                inspectAndExtractPackage(sourceFile, bundleDir)
+            }
+            if (inspected is PackageInspectResult.Invalid) {
+                return failure(inspected.reasonRes)
+            }
+            val bundle = (inspected as PackageInspectResult.Valid).bundle
+
+            if (bundle.format == PackageFormat.SingleApk) {
+                val apkSize = sourceFile.length()
+                if (apkSize <= 0L) return failure(R.string.err_read_file)
+                val pkg = withContext(Dispatchers.IO) { packageNameOfFile(sourceFile) }
+                val label = installLabel(pkg, fileName, generic)
+                if (mine != generation) throw CancellationException()
+                install = install?.copy(name = label)
+                fun report(sent: Long) = updateInstallProgress(mine, sent, apkSize)
+                // The client's own watchdog times the stream out; a slow install must never close the whole session.
+                suspend fun attempt(bypass: Boolean): String = blocking(INSTALL_TIMEOUT_MS, disconnectOnTimeout = false) {
+                    report(0)
+                    sourceFile.inputStream().use { adb.install(streamInstallCommand(apkSize, bypass), apkSize, it, ::report) }
+                }
+                var output = attempt(bypass = true)
+                if (shouldRetryWithoutBypass(output)) output = attempt(bypass = false)
+                val result = parsePmOutput(output)
+                val status = install ?: InstallStatus(false, name = label)
+                return if (result.success) status.copy(working = false, ok = true, percent = 100, phase = InstallPhase.Done)
+                else failed(status, pmFailure(result.line))
+            }
+
+            // Bundle (APKS / XAPK / APKM / Split ZIP): delete sourceFile immediately so we do not hold 2x disk space,
+            // then detect package name from manifest.json / info.json or base APK.
+            val pkg = withContext(Dispatchers.IO) {
+                runCatching { sourceFile.delete() }
+                bundle.packageName ?: bundle.findBaseApk()?.file?.let(::packageNameOfFile)
+            }
+            val label = installLabel(pkg, fileName, generic)
+            if (mine != generation) throw CancellationException()
+            install = install?.copy(name = label)
+
+            val localAbis = Build.SUPPORTED_ABIS.toList()
+            val localDpi = app.resources.displayMetrics.densityDpi
+            val localLang = java.util.Locale.getDefault().language
+
+            val outcome = blocking(INSTALL_TIMEOUT_MS, disconnectOnTimeout = false) {
+                val deviceSpec = queryDeviceSpec(adb, localAbis, localDpi, localLang)
+                when (val filtered = filterSplits(bundle.apks, deviceSpec, bundle.baseApkName, pkg)) {
+                    is SplitFilterResult.IncompatibleAbi -> BundleOutcome.FailedReason(filtered.reasonRes)
+                    is SplitFilterResult.Selected -> {
+                        val result = installBundleSession(
+                            adb = adb,
+                            splits = filtered.splits,
+                            obbs = bundle.obbs,
+                            packageName = pkg,
+                            onProgress = { sent, total -> updateInstallProgress(mine, sent, total) },
+                        )
+                        BundleOutcome.Pm(result)
+                    }
+                }
+            }
+
+            val status = install ?: InstallStatus(false, name = label)
+            return when (outcome) {
+                is BundleOutcome.FailedReason -> failed(status, InstallFailure(outcome.reasonRes, null))
+                is BundleOutcome.Pm -> {
+                    if (outcome.result.success) status.copy(working = false, ok = true, percent = 100, phase = InstallPhase.Done)
+                    else failed(status, pmFailure(outcome.result.line))
+                }
+            }
         } finally {
-            copy.delete()
+            withContext(NonCancellable + Dispatchers.IO) {
+                runCatching { bundleDir.deleteRecursively() }
+            }
         }
+    }
+
+    private sealed interface BundleOutcome {
+        data class FailedReason(val reasonRes: Int) : BundleOutcome
+        data class Pm(val result: PmResult) : BundleOutcome
+    }
+
+    private fun packageNameOfFile(apkFile: File): String? = try {
+        @Suppress("DEPRECATION")
+        getApplication<Application>().packageManager.getPackageArchiveInfo(apkFile.path, 0)?.packageName
+    } catch (t: Throwable) {
+        null
     }
 
     private fun fileInfo(uri: Uri): Pair<String?, Long?> = runCatching {

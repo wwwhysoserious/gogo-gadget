@@ -32,6 +32,13 @@ interface AdbClient {
      */
     fun install(command: String, size: Long, apk: InputStream, onProgress: (Long) -> Unit = {}): String
 
+    /**
+     * Streams exactly [size] bytes from [input] into [command] over a binary-safe `exec:` stream and returns its
+     * output, reporting bytes written so far via [onProgress].
+     */
+    fun writeStream(command: String, size: Long, input: InputStream, onProgress: (Long) -> Unit = {}): String =
+        install(command, size, input, onProgress)
+
     fun disconnect()
 }
 

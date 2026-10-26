@@ -219,10 +219,9 @@ class AdbLogicTest {
         assertEquals("cmd package install -S 1234 -r -d", streamInstallCommand(1234, bypass = false))
     }
 
-    @Test fun onlySingleApkFilesAreAccepted() {
-        assertTrue(isSingleApk("app.apk"))
-        assertTrue(isSingleApk("App.APK"))
-        for (bad in listOf("app.xapk", "app.apks", "app.apkm", "bundle.zip", "apk", "", null)) assertFalse(bad.toString(), isSingleApk(bad))
+    @Test fun installWriteSuccessLineCountsAsSuccess() {
+        assertEquals(PmResult(true, "Success"), parsePmOutput("Success: streamed 4096 bytes\n"))
+        assertEquals(PmResult(true, "Success"), parsePmOutput("Success: created install session [123456]\n"))
     }
 
     // ---- recent devices ----

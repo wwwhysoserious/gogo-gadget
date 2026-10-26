@@ -198,7 +198,7 @@ data class PmResult(val success: Boolean, val line: String)
 /** Reads the output of `pm install`: only a "Success" line counts as success. */
 fun parsePmOutput(output: String): PmResult {
     val lines = output.replace("\r", "").lines().map { it.trim() }.filter { it.isNotEmpty() }
-    if (lines.any { it == "Success" }) return PmResult(true, "Success")
+    if (lines.any { it == "Success" || it.startsWith("Success:") }) return PmResult(true, "Success")
     val failure = lines.firstOrNull { it.startsWith("Failure") || it.startsWith("Error") || it.startsWith("Exception") }
     return PmResult(false, failure ?: lines.lastOrNull() ?: "No output from pm")
 }
@@ -407,7 +407,7 @@ fun outputBeforeMarker(output: String): String? =
 /** Install output is complete at the marker, or as soon as `pm` has printed its Success/Failure line. */
 fun isInstallOutputComplete(output: String): Boolean =
     outputBeforeMarker(output) != null ||
-        output.lineSequence().map { it.trim() }.any { it == "Success" || it.startsWith("Failure") }
+        output.lineSequence().map { it.trim() }.any { it == "Success" || it.startsWith("Success:") || it.startsWith("Failure") }
 
 private const val MaxOutputBytes = 1 shl 20
 
@@ -434,9 +434,6 @@ fun installTimeoutMs(size: Long): Long = (60_000L + size.coerceAtLeast(0) / 100)
  * timed out while the session is healthy is an install failure and the session stays up.
  */
 fun installErrorIsConnectionLoss(sessionConnected: Boolean): Boolean = !sessionConnected
-
-/** Phase 2 installs a single .apk only; split formats arrive in phase 3. */
-fun isSingleApk(displayName: String?): Boolean = displayName?.trim()?.lowercase()?.endsWith(".apk") == true
 
 // ---- Recent devices (name, host, port only: nothing secret) ----
 

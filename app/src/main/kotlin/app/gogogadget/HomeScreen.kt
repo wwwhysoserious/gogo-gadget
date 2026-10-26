@@ -199,16 +199,50 @@ fun HomeScreen(
     }
 }
 
-/** Package name (or file name), plus the plain failure reason and the collapsible raw diagnostic line. */
+/** Package name (or file name) with its result mark, plus the plain failure reason and the collapsible raw diagnostic line. */
 @Composable
 private fun InstallBlock(palette: Palette, install: InstallStatus) {
     Column(Modifier.fillMaxWidth()) {
         if (install.name.isNotEmpty()) {
-            Text(
-                install.name,
-                style = MaterialTheme.typography.bodyMedium,
-                color = Color(palette.text),
-            )
+            val mark = packageResultMark(install.working, install.ok)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (mark != PackageResultMark.None) {
+                    val markColor = Color(if (mark == PackageResultMark.Check) palette.success else palette.error)
+                    Canvas(Modifier.size(12.dp)) {
+                        val w = 2.dp.toPx()
+                        when (mark) {
+                            PackageResultMark.Check -> {
+                                val p1 = Offset(size.width * 0.12f, size.height * 0.55f)
+                                val p2 = Offset(size.width * 0.42f, size.height * 0.85f)
+                                val p3 = Offset(size.width * 0.90f, size.height * 0.18f)
+                                drawLine(markColor, p1, p2, strokeWidth = w)
+                                drawLine(markColor, p2, p3, strokeWidth = w)
+                            }
+                            PackageResultMark.Cross -> {
+                                drawLine(
+                                    markColor,
+                                    Offset(size.width * 0.15f, size.height * 0.15f),
+                                    Offset(size.width * 0.85f, size.height * 0.85f),
+                                    strokeWidth = w,
+                                )
+                                drawLine(
+                                    markColor,
+                                    Offset(size.width * 0.85f, size.height * 0.15f),
+                                    Offset(size.width * 0.15f, size.height * 0.85f),
+                                    strokeWidth = w,
+                                )
+                            }
+                            PackageResultMark.None -> {}
+                        }
+                    }
+                    Spacer(Modifier.width(8.dp))
+                }
+                Text(
+                    install.name,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Color(palette.text),
+                )
+            }
         }
         if (!install.working && !install.ok) {
             // Only the plain sentence on the main screen; the raw line stays behind "Details" (diagnostic until v1.0).
