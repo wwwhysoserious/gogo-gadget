@@ -1023,19 +1023,8 @@ private fun ConnectionPanel(
                         style = MaterialTheme.typography.bodyMedium,
                         color = Color(palette.error),
                         textAlign = TextAlign.Center,
-                        modifier = Modifier.padding(bottom = if (connection.detail == null) 8.dp else 2.dp),
+                        modifier = Modifier.padding(bottom = 8.dp),
                     )
-                    // Temporary (remove before v1.0): the real cause, so a failure on a device can be diagnosed.
-                    connection.detail?.let { detail ->
-                        Text(
-                            detail,
-                            style = MaterialTheme.typography.bodySmall,
-                            fontFamily = FontFamily.Monospace,
-                            color = secondary,
-                            textAlign = TextAlign.Center,
-                            modifier = Modifier.padding(bottom = 8.dp),
-                        )
-                    }
                 }
                 when (state) {
                     ConnectionState.Pairing -> PairingForm(
