@@ -126,6 +126,12 @@ fun SettingsScreen(
         return
     }
     val context = LocalContext.current
+    var iconOpen by rememberSaveable { mutableStateOf(false) }
+    var appIcon by remember { mutableStateOf(currentAppIcon(context)) }
+    if (iconOpen) {
+        IconPicker(palette, appIcon, onSelect = { setAppIcon(context, it); appIcon = it }, onBack = { iconOpen = false })
+        return
+    }
     val shieldStore = remember(context) { ShieldSettingsStore(context) }
     val installStore = remember(context) { InstallSettingsStore(context) }
     var homeShortcut by rememberSaveable { mutableStateOf(installStore.homeShortcut) }
@@ -164,7 +170,7 @@ fun SettingsScreen(
         )
         GroupHeader(palette, R.string.group_appearance)
         SettingRow(palette, R.string.theme, s(label(selected)), onClick = { onThemeOpen(true) })
-        SettingRow(palette, R.string.app_icon, s(R.string.app_icon_value))
+        SettingRow(palette, R.string.app_icon, s(appIcon.label), onClick = { iconOpen = true })
         GroupHeader(palette, R.string.group_security)
         SettingRow(
             palette = palette,
@@ -267,6 +273,52 @@ private fun ThemePicker(palette: Palette, selected: ThemeSetting, onSelect: (The
             }
         }
         Divider(palette)
+    }
+}
+
+@Composable
+private fun IconPicker(palette: Palette, selected: AppIcon, onSelect: (AppIcon) -> Unit, onBack: () -> Unit) {
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
+        Row(Modifier.fillMaxWidth().height(56.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                stringResource(R.string.back),
+                style = MaterialTheme.typography.bodyMedium,
+                color = Color(palette.accent),
+                modifier = Modifier.clickable(role = Role.Button, onClick = onBack).height(56.dp)
+                    .padding(horizontal = Margin).padding(vertical = 16.dp),
+            )
+        }
+        Divider(palette)
+        Text(
+            stringResource(R.string.app_icon),
+            style = MaterialTheme.typography.bodyMedium,
+            color = Color(palette.secondary),
+            modifier = Modifier.padding(horizontal = Margin, vertical = 16.dp).semantics { heading() },
+        )
+        AppIcon.entries.forEach { option ->
+            Divider(palette)
+            Row(
+                Modifier.fillMaxWidth().height(56.dp)
+                    .selectable(option == selected, role = Role.RadioButton) { onSelect(option) }
+                    .padding(horizontal = Margin),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    stringResource(option.label),
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = Color(if (option == selected) palette.accent else palette.text),
+                    modifier = Modifier.weight(1f),
+                )
+                if (option == selected) Box(Modifier.size(8.dp).background(Color(palette.accent)))
+            }
+        }
+        Divider(palette)
+        Text(
+            stringResource(R.string.app_icon_note),
+            style = MaterialTheme.typography.bodySmall,
+            color = Color(palette.secondary),
+            modifier = Modifier.padding(horizontal = Margin, vertical = 16.dp),
+        )
     }
 }
 

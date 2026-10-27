@@ -191,7 +191,7 @@
     <string name="group_language">Language</string>
     <string name="group_about">About</string>
     <string name="app_icon">App icon</string>
-    <string name="app_icon_value">Blue</string>
+    <string name="app_icon_note">The launcher may take a few seconds to show the new icon. If your home screen shortcut disappears, add GoGo Gadget again from the app drawer.</string>
     <string name="antivirus_shield">Antivirus shield</string>
     <string name="on">On</string>
     <string name="off">Off</string>
