@@ -410,6 +410,7 @@ class PackageBundleTest {
         val adb = FakeAdbClient(
             onShell = { cmd ->
                 when {
+                    cmd == DisableAdbVerifyCommand || cmd == DisableVerifierCommand -> ""
                     cmd == "pm install-create -r -d --bypass-low-target-sdk-block" ->
                         "Error: Unknown option: --bypass-low-target-sdk-block"
                     cmd == "pm install-create -r -d" ->
@@ -451,10 +452,12 @@ class PackageBundleTest {
         assertTrue(result.success)
         assertEquals(
             listOf(
+                DisableAdbVerifyCommand,
+                DisableVerifierCommand,
                 "pm install-create -r -d --bypass-low-target-sdk-block",
                 "pm install-create -r -d",
-                "mkdir -p '/sdcard/Android/obb/com.example.game'",
                 "pm install-commit 778899",
+                "mkdir -p '/sdcard/Android/obb/com.example.game'",
             ),
             adb.shellCommands,
         )
@@ -518,12 +521,129 @@ class PackageBundleTest {
         assertTrue("pm install-abandon 5555" in adb.shellCommands)
     }
 
+    // ---- Package name, OBB destination and zip caps ----
+
+    private fun obbFile(name: String, pkg: String?, claims: List<String> = emptyList()) = ExtractedFile(
+        entryPath = "Android/obb/${pkg ?: "x"}/$name",
+        name = name,
+        size = 10,
+        obbPackageName = pkg,
+        otherPackageClaims = claims,
+        bytes = ByteArray(10),
+    )
+
+    @Test fun packageNameComesFromBaseApkNotJson() {
+        val honest = checkBundlePackage("com.real.app", listOf("com.real.app", "com.real.app"), claimed = "com.real.app")
+        assertEquals(BundlePackageCheck("com.real.app", null), honest)
+        assertEquals(BundlePackageCheck("com.real.app", null), checkBundlePackage("com.real.app", listOf("com.real.app"), claimed = null))
+        // The JSON names another app: the name stays the APK's, and the bundle is flagged.
+        val lying = checkBundlePackage("com.real.app", listOf("com.real.app"), claimed = "com.victim.app")
+        assertEquals("com.real.app", lying.packageName)
+        assertEquals(BundlePackageProblem.Mismatch, lying.problem)
+        // Unreadable base APK: no name at all, never the JSON's.
+        assertEquals(BundlePackageCheck(null, BundlePackageProblem.Unreadable), checkBundlePackage(null, listOf(null), claimed = "com.victim.app"))
+    }
+
+    @Test fun bundleWithMismatchedSplitPackageIsBlocked() {
+        val mixed = checkBundlePackage("com.real.app", listOf("com.real.app", "com.other.app"), claimed = null)
+        assertEquals(BundlePackageProblem.Mismatch, mixed.problem)
+        val configSplits = checkBundlePackage("com.real.app", listOf("com.real.app", null), claimed = null)
+        assertNull(configSplits.problem)
+        assertEquals("com.real.app", configSplits.packageName)
+    }
+
+    @Test fun obbMismatchedPackageIsRejected() {
+        val pkg = "com.example.game"
+        val cases = listOf(
+            listOf(obbFile("main.1.$pkg.obb", "com.victim.app")),
+            listOf(obbFile("main.1.com.victim.app.obb", pkg)),
+            listOf(obbFile("main.1.$pkg.obb", pkg, claims = listOf("com.victim.app"))),
+        )
+        for (obbs in cases) {
+            val adb = FakeAdbClient()
+            val result = installBundleSession(adb, listOf(fakeApk("base.apk", 100)), obbs, packageName = pkg)
+            assertFalse(result.success)
+            assertTrue(ObbOtherAppCode in result.line)
+            assertEquals(R.string.reason_obb_other_app, pmFailure(result.line).reason)
+            // Nothing was written, not even a session.
+            assertTrue(adb.shellCommands.isEmpty())
+            assertTrue(adb.writeCommands.isEmpty())
+        }
+        // No known package at all: the OBB cannot be placed anywhere.
+        val none = FakeAdbClient()
+        assertFalse(installBundleSession(none, listOf(fakeApk("base.apk", 100)), listOf(obbFile("main.1.$pkg.obb", pkg)), packageName = null).success)
+        assertTrue(none.shellCommands.isEmpty())
+        assertTrue(obbBelongsTo(obbFile("main.1.$pkg.obb", pkg), pkg))
+    }
+
+    @Test fun obbWrittenOnlyAfterCommit() {
+        val pkg = "com.example.game"
+        val events = mutableListOf<String>()
+        fun adbWith(commit: String, obbWrite: String) = FakeAdbClient(
+            onShell = { cmd ->
+                events += cmd
+                when {
+                    cmd.startsWith("pm install-create") -> "Success: created install session [31]"
+                    cmd == "pm install-commit 31" -> commit
+                    else -> ""
+                }
+            },
+            onWrite = { cmd, size, input, _ ->
+                events += cmd.substringBefore(' ')
+                input.readBytes()
+                if (cmd.startsWith("head -c")) obbWrite else "Success: streamed $size bytes"
+            },
+        )
+        val obbs = listOf(obbFile("main.1.$pkg.obb", pkg))
+
+        // Success: install-write, commit, and only then the OBB directory and file.
+        val ok = installBundleSession(adbWith("Success", ""), listOf(fakeApk("base.apk", 100)), obbs, packageName = pkg)
+        assertTrue(ok.success)
+        assertNull(ok.obbFailure)
+        val commitAt = events.indexOf("pm install-commit 31")
+        assertTrue(commitAt > 0)
+        assertTrue(events.indexOfFirst { it.startsWith("mkdir") } > commitAt)
+        assertTrue(events.indexOfFirst { it == "head" } > commitAt)
+
+        // A failed commit writes nothing.
+        events.clear()
+        val failed = installBundleSession(adbWith("Failure [INSTALL_FAILED_VERSION_DOWNGRADE]", ""), listOf(fakeApk("base.apk", 100)), obbs, packageName = pkg)
+        assertFalse(failed.success)
+        assertTrue(events.none { it.startsWith("mkdir") || it == "head" })
+
+        // The install worked but the OBB write failed: still reported, never a silent success.
+        events.clear()
+        val partial = installBundleSession(adbWith("Success", "head: write error"), listOf(fakeApk("base.apk", 100)), obbs, packageName = pkg)
+        assertTrue(partial.success)
+        assertEquals("head: write error", partial.obbFailure)
+    }
+
+    @Test fun zipEntryCountAndUncompressedSizeCapped() {
+        assertTrue(zipWithinLimits(MaxZipEntries, MaxZipUncompressedBytes))
+        assertFalse(zipWithinLimits(MaxZipEntries + 1, 10L))
+        assertFalse(zipWithinLimits(10, MaxZipUncompressedBytes + 1))
+        assertFalse(zipWithinLimits(10, -1L))
+        assertTrue(hasRoomToExtract(freeBytes = 1_050L, extractBytes = 1_000L))
+        assertFalse(hasRoomToExtract(freeBytes = 1_049L, extractBytes = 1_000L))
+
+        fun zipWithEntries(count: Int) = makeZip(
+            "AndroidManifest.xml" to "manifest".toByteArray(),
+            *Array(count - 1) { i -> "res/f$i" to ByteArray(1) },
+        )
+        val ok = inspectBytes(zipWithEntries(MaxZipEntries))
+        assertTrue(ok is PackageInspectResult.Valid)
+        val tooMany = inspectBytes(zipWithEntries(MaxZipEntries + 1))
+        assertEquals(PackageInspectResult.Invalid(R.string.reason_too_complex), tooMany)
+    }
+
     @Test fun allRegexPatternsEscapeLiteralBracesAndBracketsForAndroidIcu() {
         val classes = listOf(
             Class.forName("app.gogogadget.PackageBundleKt"),
             Class.forName("app.gogogadget.AdbLogicKt"),
             Class.forName("app.gogogadget.InstallLogicKt"),
             Class.forName("app.gogogadget.SecurityShieldKt"),
+            Class.forName("app.gogogadget.VirusTotalKt"),
+            Class.forName("app.gogogadget.StaticAnalyzerKt"),
         )
         val regexPatterns = mutableListOf<Pair<String, String>>()
         for (cls in classes) {

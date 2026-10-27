@@ -193,7 +193,8 @@ fun diagnostic(e: Throwable): String =
 
 // ---- Installing ----
 
-data class PmResult(val success: Boolean, val line: String)
+/** [obbFailure] is set when the install worked but its OBB data files could not be written. */
+data class PmResult(val success: Boolean, val line: String, val obbFailure: String? = null)
 
 /** Reads the output of `pm install`: only a "Success" line counts as success. */
 fun parsePmOutput(output: String): PmResult {

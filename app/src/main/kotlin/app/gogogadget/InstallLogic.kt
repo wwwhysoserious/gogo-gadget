@@ -36,8 +36,11 @@ fun packageResultMark(working: Boolean, ok: Boolean): PackageResultMark = when {
     else -> PackageResultMark.Cross
 }
 
-/** What the caption inside the button says: checking the package, bytes still going out, waiting for pm's answer, or finished. */
-enum class InstallPhase { Checking, Sending, Installing, Done }
+/**
+ * What the caption inside the button says: checking the package, uploading it to VirusTotal, waiting for VirusTotal's
+ * analysis, bytes still going out, waiting for pm's answer, or finished.
+ */
+enum class InstallPhase { Checking, Uploading, Analysing, Sending, Installing, Done }
 
 data class PhaseState(val phase: InstallPhase, val percent: Int)
 
@@ -107,6 +110,7 @@ private val PmReasons = mapOf(
     "INSTALL_FAILED_NO_MATCHING_ABIS" to R.string.reason_abis,
     "INSTALL_FAILED_ALREADY_EXISTS" to R.string.reason_exists,
     "INSTALL_FAILED_USER_RESTRICTED" to R.string.reason_restricted,
+    ObbOtherAppCode to R.string.reason_obb_other_app,
 )
 
 /** Maps a pm failure line to a plain reason; a line with no known code is "unknown", never a guess. */

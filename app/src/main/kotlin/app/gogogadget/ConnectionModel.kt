@@ -4,6 +4,7 @@ import android.app.Application
 import android.content.Context
 import android.net.Uri
 import android.os.Build
+import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import android.provider.Settings
 import androidx.compose.runtime.getValue
@@ -12,12 +13,14 @@ import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.async
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
@@ -33,6 +36,58 @@ import java.io.IOException
 import java.net.ConnectException
 import java.net.SocketTimeoutException
 
+/** The Security shield asks to send [fileCount] unknown files ([totalBytes] in all) to VirusTotal; answers carry the [id]. */
+data class UploadPrompt(val id: Int, val fileCount: Int, val totalBytes: Long)
+
+/**
+ * Interactive Caution Prompt (Yellow Tier):
+ * The Security shield asks the user to acknowledge caution/mod risk on a YELLOW tier package; answers carry the [id].
+ */
+data class CautionPrompt(val id: Int, val packageName: String?, val reason: ShieldWarningReason, val detail: String)
+
+/**
+ * Checks whether an installation is permitted under the 3-Color Security Tier Architecture:
+ * - Green / Clean: always permitted.
+ * - Shield Off (null): permitted.
+ * - Yellow: permitted ONLY if [userOverridden] is true AND all warning reasons are Yellow severity.
+ * - Red: NEVER permitted. Protected fail-closed.
+ */
+fun mayInstall(verdict: ShieldVerdict?, userOverridden: Boolean = false): Boolean =
+    verdict == null || verdict is ShieldVerdict.Clean ||
+        (userOverridden && verdict is ShieldVerdict.Warning && verdict.reasons.all { it.severity() == SecuritySeverity.Yellow })
+
+/**
+ * Gate that suspends install execution on a YELLOW warning and awaits user decision.
+ */
+class CautionGate {
+    private var lastId = 0
+    private var pending: Pair<Int, CompletableDeferred<Boolean>>? = null
+
+    fun open(): Pair<Int, CompletableDeferred<Boolean>> {
+        pending?.second?.complete(false)
+        return (++lastId to CompletableDeferred<Boolean>()).also { pending = it }
+    }
+
+    fun answer(id: Int, confirmed: Boolean) {
+        pending?.takeIf { it.first == id }?.second?.complete(confirmed)
+    }
+
+    fun declinePending() {
+        pending?.second?.complete(false)
+    }
+
+    fun close(question: Pair<Int, CompletableDeferred<Boolean>>) {
+        if (pending === question) pending = null
+    }
+}
+
+/** What the shield decided, and the files (with size and SHA-256) it checked, so they can be compared again before streaming. */
+private data class ShieldRun(
+    val verdict: ShieldVerdict?,
+    val scanned: List<ScannedFile>,
+    val installedInfo: InstalledAppInfo? = null,
+)
+
 /**
  * The last install attempt. [name] is the package name (or file name) once known; [percent] is 0..100 and stays
  * visible with the result. A failure has a [reason] (string resource, null when unknown) and the raw [raw] line.
@@ -47,7 +102,13 @@ data class InstallStatus(
     val raw: String? = null,
     val shieldVerdict: ShieldVerdict? = null,
     val shieldChecking: Boolean = false,
+    val uploadPrompt: UploadPrompt? = null,
+    val cautionPrompt: CautionPrompt? = null,
     val logs: List<String> = emptyList(),
+    /** The shield was switched off for this install, so the package was not checked. */
+    val shieldOff: Boolean = false,
+    val sourceUri: Uri? = null,
+    val userAuthorized: Boolean = false,
 )
 
 private const val PREFS = "devices"
@@ -96,6 +157,22 @@ class ConnectionModel(
     private var abortJob: Job? = null
     private var generation = 0
 
+    /** The pending upload question; used on the main thread only. */
+    private val uploadGate = UploadGate()
+
+    /** The pending caution confirmation question; used on the main thread only. */
+    private val cautionGate = CautionGate()
+
+    val backupManager = BackupManager(app)
+    var backups by mutableStateOf<List<AppBackupItem>>(emptyList())
+        private set
+
+    var cautionPrompt by mutableStateOf<CautionPrompt?>(null)
+        private set
+
+    /** Shared by every VirusTotal request (lookups, upload calls, polling): the public API allows 4 per minute. */
+    private val vtPacer = RequestPacer()
+
     /** True while the pairing was done by the notification service, so the connect result is reported there too. */
     private var viaService = false
 
@@ -105,8 +182,92 @@ class ConnectionModel(
 
     init {
         PairingBridge.onPaired = ::pairedByService
+        refreshBackups()
         // Reconnect quietly to the last device with the stored key.
         recent.firstOrNull()?.let { connect(it, silent = true) }
+    }
+
+    fun refreshBackups() {
+        viewModelScope.launch(Dispatchers.IO) {
+            val list = backupManager.listBackups()
+            withContext(Dispatchers.Main) {
+                backups = list
+            }
+        }
+    }
+
+    fun confirmCaution(promptId: Int) {
+        cautionGate.answer(promptId, true)
+    }
+
+    fun cancelCaution(promptId: Int) {
+        cautionGate.answer(promptId, false)
+    }
+
+    fun deleteBackup(packageName: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            backupManager.deleteBackup(packageName)
+            val updated = backupManager.listBackups()
+            withContext(Dispatchers.Main) {
+                backups = updated
+            }
+        }
+    }
+
+    fun revertBackup(backup: AppBackupItem) {
+        if (connection.state != ConnectionState.Connected || install?.working == true) return
+        val mine = generation
+        val label = backup.appName.ifBlank { backup.packageName }
+        install = InstallStatus(working = true, name = label, phase = InstallPhase.Sending, percent = 0)
+        installJob = viewModelScope.launch {
+            appendLog(mine, "> revert: restoring v${backup.versionCode}...")
+            try {
+                val outcome = blocking(INSTALL_TIMEOUT_MS, disconnectOnTimeout = false) {
+                    if (backup.apkFiles.size == 1) {
+                        val apkFile = backup.apkFiles.first()
+                        val apkSize = apkFile.length()
+                        fun report(sent: Long) = updateInstallProgress(mine, sent, apkSize)
+                        report(0)
+                        val cmd = streamInstallCommand(apkSize, bypass = true, userInstall = false)
+                        postLog(mine, "> adb: $cmd")
+                        val output = apkFile.inputStream().use { input ->
+                            adb.install(cmd, apkSize, input, ::report)
+                        }
+                        parsePmOutput(output)
+                    } else {
+                        val splits = backup.apkFiles.map { file ->
+                            ExtractedFile(
+                                entryPath = file.name,
+                                name = file.name,
+                                size = file.length(),
+                                file = file,
+                            )
+                        }
+                        installBundleSession(
+                            adb = adb,
+                            splits = splits,
+                            obbs = emptyList(),
+                            packageName = backup.packageName,
+                            onProgress = { sent, total -> updateInstallProgress(mine, sent, total) },
+                            onLog = { line -> postLog(mine, line) },
+                            userInstall = false,
+                        )
+                    }
+                }
+                appendLog(mine, "> pm: ${outcome.line.ifBlank { if (outcome.success) "Success" else "Failure" }}")
+                val status = install ?: InstallStatus(false, name = label)
+                install = if (outcome.success) {
+                    status.copy(working = false, ok = true, percent = 100, phase = InstallPhase.Done)
+                } else {
+                    failed(status, pmFailure(outcome.line))
+                }
+            } catch (e: CancellationException) {
+                if (install?.working == true) install = failed(install, transferFailure(e, null))
+                throw e
+            } catch (t: Throwable) {
+                install = failed(install, transferFailure(t, diagnostic(t)))
+            }
+        }
     }
 
     fun thisDevice(): Target {
@@ -238,6 +399,10 @@ class ConnectionModel(
 
     private fun begin() {
         generation++
+        // A pending upload question counts as "no".
+        uploadGate.declinePending()
+        cautionGate.declinePending()
+        cautionPrompt = null
         job?.cancel()
         installJob?.cancel()
         installJob = null
@@ -386,7 +551,7 @@ class ConnectionModel(
         if (uri == null || connection.state != ConnectionState.Connected || install?.working == true) return
         val shieldOn = shieldSettings.shieldEnabled
         val initialPhase = if (shieldOn) InstallPhase.Checking else InstallPhase.Sending
-        install = InstallStatus(working = true, phase = initialPhase, shieldChecking = shieldOn)
+        install = InstallStatus(working = true, phase = initialPhase, shieldChecking = shieldOn, sourceUri = uri)
         installJob = viewModelScope.launch {
             val result = try {
                 installApk(uri)
@@ -414,6 +579,8 @@ class ConnectionModel(
             raw = failure.raw,
             shieldVerdict = status?.shieldVerdict,
             shieldChecking = false,
+            uploadPrompt = null,
+            sourceUri = status?.sourceUri,
             logs = status?.logs.orEmpty() + listOfNotNull(failure.raw?.takeIf { it.isNotBlank() }?.let { "> error: $it" }),
         )
 
@@ -447,23 +614,21 @@ class ConnectionModel(
     }
 
     /**
-     * Runs the Antivirus shield check (SHA-256 + offline signature/manifest analysis + optional VirusTotal lookup).
-     * Returns null when the shield is disabled, or the evaluated [ShieldVerdict] when enabled.
+     * Runs the Antivirus shield check (SHA-256 + offline signature/manifest analysis + a VirusTotal lookup of every APK,
+     * and an upload of unknown ones when the user agrees). Returns null when the shield is disabled, otherwise a
+     * [ShieldVerdict.Clean] or [ShieldVerdict.Warning]: whatever could not be proven clean is blocked.
      */
     private suspend fun verifyPackageWithShield(
         mine: Int,
         app: Application,
         sourceFile: File,
+        displayName: String,
         bundle: ExtractedBundle,
         pkg: String?,
+        pkgProblem: BundlePackageProblem?,
         isLocalDevice: Boolean,
-    ): ShieldVerdict? {
-        if (!shieldSettings.shieldEnabled) {
-            appendLog(mine, "> shield: OFF (disabled in settings)")
-            return null
-        }
-        appendLog(mine, "> shield: scanning archive, X.509 certificates & AndroidManifest.xml...")
-        val installedInfo = if (!pkg.isNullOrBlank()) {
+    ): ShieldRun {
+        val installedInfo = if (!pkg.isNullOrBlank() && pkgProblem == null) {
             try {
                 blocking(CONNECT_TIMEOUT_MS, disconnectOnTimeout = false) {
                     queryInstalledAppInfo(adb, pkg, app.takeIf { isLocalDevice })
@@ -476,6 +641,13 @@ class ConnectionModel(
         } else {
             null
         }
+
+        if (!shieldSettings.shieldEnabled) {
+            appendLog(mine, "> shield: OFF (disabled in settings)")
+            if (mine == generation) install = install?.copy(shieldOff = true)
+            return ShieldRun(null, emptyList(), installedInfo)
+        }
+        appendLog(mine, "> shield: scanning archive, X.509 certificates & AndroidManifest.xml...")
 
         val (sha256, offline) = withContext(Dispatchers.IO) {
             val hash = sha256Hex(sourceFile)
@@ -495,58 +667,240 @@ class ConnectionModel(
         }
 
         appendLog(mine, "> sha256: $sha256")
+        if (pkgProblem != null) {
+            appendLog(
+                mine,
+                if (pkgProblem == BundlePackageProblem.Unreadable) "> package: package name unreadable"
+                else "> package: the name in the bundle does not match its APK files",
+            )
+            appendLog(mine, "> shield verdict: BLOCKED (${ShieldWarningReason.PackageMismatch.name})")
+            return ShieldRun(ShieldVerdict.Warning(sha256, listOf(ShieldWarningReason.PackageMismatch), 0, 0, offline), emptyList(), installedInfo)
+        }
         offline.versionCode?.let { vc ->
             appendLog(mine, "> versionCode: $vc${installedInfo?.versionCode?.let { " (installed on target: $it)" }.orEmpty()}")
         }
         val sigDetail = offline.certSubject ?: offline.signerSha256?.let(::truncateSha256) ?: "unknown"
         when {
-            !offline.signed -> appendLog(mine, "> signature: UNSIGNED (no valid V1/V2/V3 certificate)")
+            !offline.signed && offline.signerSha256 == null -> appendLog(mine, "> signature: UNSIGNED (signer certificate unreadable)")
+            !offline.signed -> appendLog(mine, "> signature: UNSIGNED (a split has no V1/V2/V3 certificate)")
             offline.debugOrTestSigned -> appendLog(mine, "> signature: UNTRUSTED TEST/MOD KEY ($sigDetail)")
             offline.signatureMismatch -> appendLog(mine, "> signature: MISMATCH vs installed app ($sigDetail)")
-            else -> appendLog(mine, "> signature: VALID ($sigDetail)")
+            else -> appendLog(mine, "> signature: certificate read ($sigDetail), not verified here: the Android installer does that")
         }
         if (offline.allPermissions.isEmpty()) {
-            appendLog(mine, "> permissions: 0 requested in AndroidManifest.xml (0 auto-granted)")
+            appendLog(mine, "> permissions: 0 requested in AndroidManifest.xml (none granted by GoGo)")
         } else {
             appendLog(
                 mine,
-                "> permissions (${offline.allPermissions.size} requested, 0 auto-granted — user decides): ${offline.allPermissions.joinToString(", ")}",
+                "> permissions (${offline.allPermissions.size} requested, none granted by GoGo — user decides): ${offline.allPermissions.joinToString(", ")}",
             )
         }
         if (offline.highRiskPermissions.isNotEmpty()) {
             appendLog(mine, "> high-risk flags: ${offline.highRiskPermissions.joinToString(", ")}")
         }
 
-        val apiKey = withContext(Dispatchers.IO) { shieldSettings.loadVirusTotalApiKey() }
-        val vt = if (!apiKey.isNullOrBlank()) {
-            appendLog(mine, "> virustotal: GET /api/v3/files/${truncateSha256(sha256)}...")
-            val res = withContext(Dispatchers.IO) { checkVirusTotalHash(sha256, apiKey) }
-            when (res) {
-                is VtLookupResult.Found -> appendLog(mine, "> virustotal: ${res.malicious} malicious, ${res.suspicious} suspicious / ${res.total} engines")
-                VtLookupResult.UnknownHash -> appendLog(mine, "> virustotal: hash not in database (404)")
-                VtLookupResult.InvalidKey -> appendLog(mine, "> virustotal: API key rejected (401/403)")
-                VtLookupResult.RateLimited -> appendLog(mine, "> virustotal: rate limited (429)")
-                VtLookupResult.Unavailable -> appendLog(mine, "> virustotal: unreachable / offline")
+        val combinedOffline = if (shieldSettings.deepScanEnabled) {
+            appendLog(mine, "> deep scan: analyzing bytecode & assets...")
+            val deepScanResult = withContext(Dispatchers.IO) {
+                StaticAnalyzer.analyzeApkOrBundle(
+                    sourceFile = sourceFile,
+                    bundle = bundle,
+                    permissions = offline.allPermissions,
+                    packageName = pkg,
+                )
             }
-            res
+            if (mine != generation) throw CancellationException()
+            if (deepScanResult.issues.isNotEmpty()) {
+                for (issue in deepScanResult.issues) {
+                    appendLog(mine, "> deep scan: found ${issue.reason.name} (${issue.detail})")
+                }
+                val combinedReasons = (offline.reasons + deepScanResult.issues.map { it.reason }).distinct()
+                val primaryDetail = deepScanResult.issues.first().detail
+                offline.copy(reasons = combinedReasons, issueDetail = primaryDetail)
+            } else {
+                appendLog(mine, "> deep scan: clean (0 dropper/adware signatures, ${deepScanResult.dexCount} DEX files inspected)")
+                offline
+            }
         } else {
-            appendLog(mine, "> virustotal: skipped (no API key configured — offline shield only)")
-            null
+            offline
         }
 
-        val verdict = evaluateShieldVerdict(
-            sha256 = sha256,
-            offline = offline,
-            vt = vt,
-            deepScanEnabled = shieldSettings.deepScanEnabled,
-            fileSizeBytes = sourceFile.length(),
-        )
-        when (verdict) {
-            is ShieldVerdict.Clean -> appendLog(mine, "> shield verdict: PASS — proceeding with zero-trust install (no -g flag)")
-            is ShieldVerdict.Warning -> appendLog(mine, "> shield verdict: BLOCKED (${verdict.reasons.joinToString(", ") { it.name }}) — installation aborted")
+        val apiKey = withContext(Dispatchers.IO) { shieldSettings.loadVirusTotalApiKey() }?.takeIf { it.isNotBlank() }
+        if (mine != generation) throw CancellationException()
+        val trusted = isTrustedUpdate(combinedOffline, installedInfo)
+        // The unit of proof is each APK; the container is never looked up. OBB files are data and are not scanned.
+        if (bundle.obbs.isNotEmpty()) appendLog(mine, "> virustotal: ${bundle.obbs.size} .obb file(s) are data and are not scanned")
+        val targets = if (bundle.format == PackageFormat.SingleApk) {
+            listOf(displayName to sourceFile)
+        } else {
+            bundle.apks.map { it.name to it.file }
         }
-        return verdict
+        val evidence = mutableListOf<ShieldFileEvidence>()
+        val filesBySha = mutableMapOf<String, File>()
+        val scanned = mutableListOf<ScannedFile>()
+        if (apiKey == null) appendLog(mine, "> virustotal: no API key set, no lookup")
+        for ((name, file) in targets) {
+            val size = file?.length() ?: 0L
+            val sha = file?.let { withContext(Dispatchers.IO) { sha256Hex(it) } }.orEmpty()
+            if (file != null && sha.isNotEmpty()) {
+                filesBySha[sha] = file
+                scanned += ScannedFile(file, size, sha)
+            }
+            var res: VtLookupResult = VtLookupResult.Unavailable
+            if (apiKey != null && sha.isNotEmpty() && evidence.none { it.vt == VtLookupResult.InvalidKey }) {
+                vtPacer.await()
+                res = withContext(Dispatchers.IO) { checkVirusTotalHash(sha, apiKey) }
+                if (mine != generation) throw CancellationException()
+                appendLog(mine, vtLookupLine(sha, name, res))
+            }
+            evidence += ShieldFileEvidence(name, size, sha, res)
+        }
+
+        val first = evaluateShieldVerdict(sha256, combinedOffline, apiKey != null, trusted, evidence)
+        val verdict = if (first is ShieldVerdict.NeedsUpload && apiKey != null) {
+            resolveUpload(mine, first, filesBySha, evidence, apiKey, trusted, sha256, combinedOffline)
+        } else {
+            first
+        }
+        when (verdict) {
+            is ShieldVerdict.Clean -> appendLog(
+                mine,
+                "> shield verdict: PASS (" + when {
+                    verdict.trustedUpdate -> "update of the installed app, same signature" + (verdict.vtSummary?.let { ", VirusTotal $it" }.orEmpty())
+                    else -> "VirusTotal ${verdict.vtSummary}"
+                } + ")",
+            )
+            is ShieldVerdict.Warning -> {
+                val tier = securityTierOf(verdict)
+                if (tier == SecurityTier.Yellow) {
+                    appendLog(mine, "> shield verdict: CAUTION (${verdict.reasons.joinToString(", ") { it.name }})")
+                } else {
+                    appendLog(mine, "> shield verdict: BLOCKED (${verdict.reasons.joinToString(", ") { it.name }})")
+                }
+            }
+            is ShieldVerdict.NeedsUpload -> appendLog(mine, "> shield verdict: BLOCKED (${ShieldWarningReason.VirusTotalUnreachable.name})")
+        }
+        return ShieldRun(
+            if (verdict is ShieldVerdict.NeedsUpload) {
+                ShieldVerdict.Warning(sha256, listOf(ShieldWarningReason.VirusTotalUnreachable), 0, 0, combinedOffline)
+            } else {
+                verdict
+            },
+            scanned,
+            installedInfo,
+        )
     }
+
+    private fun vtLookupLine(sha: String, name: String, res: VtLookupResult): String {
+        val head = "> virustotal: ${sha.take(12)} $name:"
+        return when (res) {
+            is VtLookupResult.Found -> "$head ${res.malicious} malicious, ${res.suspicious} suspicious / ${res.total} engines, " +
+                analysisAgeText(res.lastAnalysisDate, System.currentTimeMillis() / 1000L)
+            VtLookupResult.UnknownHash -> "$head not in database"
+            VtLookupResult.InvalidKey -> "$head API key rejected"
+            VtLookupResult.RateLimited -> "$head rate limited"
+            VtLookupResult.Unavailable -> "$head unreachable"
+        }
+    }
+
+    /**
+     * Asks the user before sending the unknown files to VirusTotal, uploads them and waits for the analysis, then
+     * decides again. "No", a new install, a reconnect or a failure at any step all end as a Warning.
+     */
+    private suspend fun resolveUpload(
+        mine: Int,
+        needs: ShieldVerdict.NeedsUpload,
+        filesBySha: Map<String, File>,
+        evidence: List<ShieldFileEvidence>,
+        apiKey: String,
+        trusted: Boolean,
+        sha256: String,
+        offline: OfflineScanReport,
+    ): ShieldVerdict {
+        fun warn(reason: ShieldWarningReason) = ShieldVerdict.Warning(sha256, listOf(reason), 0, 0, offline)
+        val candidates = needs.files.distinctBy { it.sha256 }
+        val totalBytes = candidates.sumOf { it.sizeBytes }
+        val question = uploadGate.open()
+        install = install?.copy(shieldChecking = false, uploadPrompt = UploadPrompt(question.first, candidates.size, totalBytes))
+        val confirmed = try {
+            question.second.await()
+        } finally {
+            uploadGate.close(question)
+            if (mine == generation) install = install?.copy(uploadPrompt = null, shieldChecking = true)
+        }
+        if (mine != generation) throw CancellationException()
+        if (!confirmed) {
+            appendLog(mine, "> virustotal: upload declined, the file stays unverified")
+            return warn(ShieldWarningReason.NotKnownToVirusTotal)
+        }
+
+        val updated = evidence.toMutableList()
+        var sentBefore = 0L
+        for (candidate in candidates) {
+            val file = filesBySha[candidate.sha256] ?: return warn(ShieldWarningReason.VirusTotalUnreachable)
+            appendLog(mine, "> virustotal: upload ${formatUploadSize(candidate.sizeBytes)} ${candidate.name} (${candidate.sha256.take(12)})")
+            install = install?.copy(phase = InstallPhase.Uploading, percent = 0)
+            val throttle = ProgressThrottle()
+            val base = sentBefore
+            vtPacer.await()
+            val upload = withContext(Dispatchers.IO) {
+                uploadFileToVirusTotal(file, apiKey) { sent, _ ->
+                    // Stops the transfer when the install was cancelled; the caller sees a CancellationException.
+                    ensureActive()
+                    if (throttle.shouldReport(System.currentTimeMillis(), sent, candidate.sizeBytes)) {
+                        updateUploadProgress(mine, base + sent, totalBytes)
+                    }
+                }
+            }
+            if (mine != generation) throw CancellationException()
+            val analysisId = (upload as? VtUploadResult.Started)?.analysisId
+            if (analysisId == null) {
+                appendLog(mine, "> virustotal: upload failed (${upload::class.simpleName})")
+                return warn(ShieldWarningReason.VirusTotalUnreachable)
+            }
+            sentBefore += candidate.sizeBytes
+            install = install?.copy(phase = InstallPhase.Analysing, percent = 99)
+            appendLog(mine, "> virustotal: analysis queued for ${candidate.name}, waiting (up to 10 min)")
+            val result = awaitVirusTotalAnalysis(analysisId, apiKey, vtPacer)
+            if (mine != generation) throw CancellationException()
+            if (result !is VtLookupResult.Found) {
+                appendLog(mine, "> virustotal: analysis of ${candidate.name} did not complete (${result::class.simpleName})")
+                return warn(ShieldWarningReason.VirusTotalUnreachable)
+            }
+            appendLog(mine, "> virustotal: analysis completed ${candidate.name}: ${result.malicious} malicious, ${result.suspicious} suspicious / ${result.total} engines")
+            updated.replaceAll { if (it.sha256 == candidate.sha256) it.copy(vt = result) else it }
+        }
+        install = install?.copy(phase = InstallPhase.Checking, percent = 0)
+        val again = evaluateShieldVerdict(sha256, offline, hasKey = true, trustedUpdate = trusted, files = updated)
+        return if (again is ShieldVerdict.NeedsUpload) warn(ShieldWarningReason.VirusTotalUnreachable) else again
+    }
+
+    /** The user's answer to the upload prompt [promptId]; called on the main thread. An answer to an older prompt is ignored. */
+    fun confirmUpload(promptId: Int) {
+        uploadGate.answer(promptId, true)
+    }
+
+    fun cancelUpload(promptId: Int) {
+        uploadGate.answer(promptId, false)
+    }
+
+    private fun updateUploadProgress(mine: Int, sent: Long, total: Long) {
+        viewModelScope.launch {
+            if (mine == generation && install?.phase == InstallPhase.Uploading) {
+                install = install?.copy(percent = installPercent(sent, total, false))
+            }
+        }
+    }
+
+    /** The [ShieldVerdict.Warning] to show for a verdict that must not install: any verdict that is not a Warning is shown as unreachable. */
+    private fun blockedBy(verdict: ShieldVerdict?): ShieldVerdict.Warning = verdict as? ShieldVerdict.Warning
+        ?: ShieldVerdict.Warning(
+            (verdict as? ShieldVerdict.NeedsUpload)?.sha256.orEmpty(),
+            listOf(ShieldWarningReason.VirusTotalUnreachable),
+            0,
+            0,
+            verdict?.offline,
+        )
 
     private fun shieldBlockedStatus(label: String, verdict: ShieldVerdict.Warning, logs: List<String>): InstallStatus {
         val primaryReasonRes = when (verdict.reasons.firstOrNull()) {
@@ -555,6 +909,16 @@ class ConnectionModel(
             ShieldWarningReason.DebugOrTestCertificate -> R.string.shield_warn_debug_cert
             ShieldWarningReason.SignatureMismatch -> R.string.shield_warn_signature
             ShieldWarningReason.VersionDowngrade -> R.string.shield_warn_downgrade
+            ShieldWarningReason.VirusTotalKeyMissing -> R.string.shield_warn_vt_key_missing
+            ShieldWarningReason.NotKnownToVirusTotal -> R.string.shield_warn_not_known
+            ShieldWarningReason.VirusTotalUnreachable -> R.string.shield_warn_vt_unreachable
+            ShieldWarningReason.TooFewEngines -> R.string.shield_warn_few_engines
+            ShieldWarningReason.TooLargeToVerify -> R.string.shield_warn_too_large
+            ShieldWarningReason.PackageMismatch -> R.string.shield_warn_package_mismatch
+            ShieldWarningReason.DropperDetected -> R.string.shield_warn_dropper_short
+            ShieldWarningReason.AdwareDetected -> R.string.shield_warn_adware_short
+            ShieldWarningReason.AbusivePermissions -> R.string.shield_warn_abusive_permissions_short
+            ShieldWarningReason.SelfUpdaterPermission -> R.string.shield_warn_self_updater
             null -> R.string.shield_blocked_generic
         }
         return InstallStatus(
@@ -568,6 +932,72 @@ class ConnectionModel(
             shieldChecking = false,
             logs = logs,
         )
+    }
+
+    private suspend fun resolveCautionPrompt(
+        mine: Int,
+        label: String,
+        pkg: String?,
+        verdict: ShieldVerdict?,
+    ): Boolean {
+        if (verdict !is ShieldVerdict.Warning) return false
+        val tier = securityTierOf(verdict)
+        if (tier != SecurityTier.Yellow) return false
+
+        val primaryReason = verdict.reasons.first()
+        val detail = when (primaryReason) {
+            ShieldWarningReason.DropperDetected ->
+                verdict.offline?.issueDetail ?: "Dynamic class loader (DexClassLoader) found in bytecode"
+            ShieldWarningReason.DebugOrTestCertificate ->
+                verdict.offline?.certSubject?.let { "Signed with test/mod certificate ($it)" }
+                    ?: "Signed with untrusted public debug or test certificate"
+            ShieldWarningReason.NotKnownToVirusTotal ->
+                "File hash is not present in VirusTotal threat database"
+            ShieldWarningReason.VirusTotalKeyMissing ->
+                "No VirusTotal API key configured in Settings"
+            else ->
+                verdict.offline?.issueDetail ?: "Potential mod or dynamic code risk detected"
+        }
+        val question = cautionGate.open()
+        val prompt = CautionPrompt(question.first, pkg, primaryReason, detail)
+        cautionPrompt = prompt
+        install = install?.copy(cautionPrompt = prompt, shieldChecking = false)
+        val proceed = try {
+            question.second.await()
+        } finally {
+            cautionGate.close(question)
+            if (mine == generation) {
+                cautionPrompt = null
+                install = install?.copy(cautionPrompt = null)
+            }
+        }
+        if (mine != generation) throw CancellationException()
+        if (!proceed) {
+            appendLog(mine, "> install: cancelled by user")
+            return false
+        }
+        appendLog(mine, "> security override: risk acknowledged by user, proceeding with installation")
+        return true
+    }
+
+    private suspend fun performAutoBackup(
+        mine: Int,
+        pkg: String?,
+        installedInfo: InstalledAppInfo?,
+    ) {
+        if (installedInfo?.versionCode == null || pkg.isNullOrBlank()) return
+        try {
+            val item = withContext(Dispatchers.IO) {
+                backupManager.createBackup(adb, pkg, installedInfo)
+            }
+            if (item != null) {
+                appendLog(mine, "> backup: saved v${item.versionCode} to local backup")
+                refreshBackups()
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Throwable) {
+        }
     }
 
     /**
@@ -617,27 +1047,64 @@ class ConnectionModel(
                 if (apkSize <= 0L) return failure(R.string.err_read_file)
                 appendLog(mine, "> container: SINGLE APK")
                 val pkg = withContext(Dispatchers.IO) { packageNameOfFile(sourceFile) }
+                val pkgProblem = BundlePackageProblem.Unreadable.takeIf { pkg == null }
                 appendLog(mine, "> package: ${pkg ?: "unknown"}")
                 if (userInstall) appendLog(mine, "> shortcut: on (the launcher adds the icon by itself on a new install; updates keep their icon)")
                 val label = installLabel(pkg, fileName, generic)
                 if (mine != generation) throw CancellationException()
                 install = install?.copy(name = label)
-                val verdict = verifyPackageWithShield(mine, app, sourceFile, bundle, pkg, isLocalDevice)
+                val shield = verifyPackageWithShield(mine, app, sourceFile, installLabel(null, fileName, "package.apk"), bundle, pkg, pkgProblem, isLocalDevice)
+                val verdict = shield.verdict
                 if (mine != generation) throw CancellationException()
                 install = install?.copy(shieldVerdict = verdict, shieldChecking = false)
+                var userOverridden = false
                 if (verdict is ShieldVerdict.Warning) {
-                    return shieldBlockedStatus(label, verdict, install?.logs.orEmpty())
+                    if (securityTierOf(verdict) == SecurityTier.Yellow) {
+                        val proceed = resolveCautionPrompt(mine, label, pkg, verdict)
+                        if (!proceed) {
+                            return InstallStatus(
+                                working = false,
+                                ok = false,
+                                name = label,
+                                percent = 100,
+                                phase = InstallPhase.Done,
+                                reason = R.string.reason_cancelled,
+                                shieldVerdict = verdict,
+                                logs = install?.logs.orEmpty(),
+                            )
+                        }
+                        userOverridden = true
+                        install = install?.copy(userAuthorized = true)
+                    } else {
+                        return shieldBlockedStatus(label, blockedBy(verdict), install?.logs.orEmpty())
+                    }
                 }
+                if (!mayInstall(verdict, userOverridden)) {
+                    return shieldBlockedStatus(label, blockedBy(verdict), install?.logs.orEmpty())
+                }
+                // The checked file must still be the file that is streamed.
+                suspend fun changedAfterScan(): Boolean {
+                    val changed = verdict != null && withContext(Dispatchers.IO) { !filesUnchangedSinceScan(shield.scanned, listOf(sourceFile)) }
+                    if (changed) appendLog(mine, "> shield: the file changed after it was checked, nothing was installed")
+                    return changed
+                }
+                if (changedAfterScan()) return failure(R.string.reason_file_changed)
+                performAutoBackup(mine, pkg, shield.installedInfo)
                 install = install?.copy(phase = InstallPhase.Sending, percent = 0)
-                appendLog(mine, "> adb: ${streamInstallCommand(apkSize, bypass = true, userInstall)} (0 permissions granted)")
+                appendLog(mine, "> adb: ${streamInstallCommand(apkSize, bypass = true, userInstall)} (none granted by GoGo)")
                 fun report(sent: Long) = updateInstallProgress(mine, sent, apkSize)
                 // The client's own watchdog times the stream out; a slow install must never close the whole session.
                 suspend fun attempt(bypass: Boolean): String = blocking(INSTALL_TIMEOUT_MS, disconnectOnTimeout = false) {
+                    check(mayInstall(verdict, userOverridden)) { "The shield did not clear this package" }
                     report(0)
+                    // Keep Google Play Protect out of ADB installs.
+                    adb.shell(DisableAdbVerifyCommand)
+                    adb.shell(DisableVerifierCommand)
                     sourceFile.inputStream().use { adb.install(streamInstallCommand(apkSize, bypass, userInstall), apkSize, it, ::report) }
                 }
                 var output = attempt(bypass = true)
                 if (shouldRetryWithoutBypass(output)) {
+                    if (changedAfterScan()) return failure(R.string.reason_file_changed)
                     appendLog(mine, "> adb: retrying ${streamInstallCommand(apkSize, bypass = false, userInstall)}")
                     output = attempt(bypass = false)
                 }
@@ -651,24 +1118,53 @@ class ConnectionModel(
             // Bundle (APKS / XAPK / APKM / Split ZIP): detect package name from manifest.json / info.json or base APK,
             // run shield check, then delete sourceFile immediately so we do not hold 2x disk space during streaming.
             appendLog(mine, "> container: ${bundle.format.name.uppercase(java.util.Locale.US)} (${bundle.apks.size} apk splits, ${bundle.obbs.size} obb files)")
-            val pkg = withContext(Dispatchers.IO) {
-                bundle.packageName ?: bundle.findBaseApk()?.file?.let(::packageNameOfFile)
+            // The package name comes from the APK files themselves, never from the bundle's own metadata.
+            val pkgCheck = withContext(Dispatchers.IO) {
+                checkBundlePackage(
+                    basePackage = bundle.findBaseApk()?.file?.let(::packageNameOfFile),
+                    splitPackages = bundle.apks.map { split -> split.file?.let(::packageNameOfFile) },
+                    claimed = bundle.packageName,
+                )
             }
+            val pkg = pkgCheck.packageName
             appendLog(mine, "> package: ${pkg ?: "unknown"}")
             if (userInstall) appendLog(mine, "> shortcut: on (the launcher adds the icon by itself on a new install; updates keep their icon)")
             val label = installLabel(pkg, fileName, generic)
             if (mine != generation) throw CancellationException()
             install = install?.copy(name = label)
-            val verdict = verifyPackageWithShield(mine, app, sourceFile, bundle, pkg, isLocalDevice)
+            val shield = verifyPackageWithShield(mine, app, sourceFile, installLabel(null, fileName, "package.apk"), bundle, pkg, pkgCheck.problem, isLocalDevice)
+            val verdict = shield.verdict
             if (mine != generation) throw CancellationException()
             install = install?.copy(shieldVerdict = verdict, shieldChecking = false)
+            var userOverridden = false
             if (verdict is ShieldVerdict.Warning) {
-                return shieldBlockedStatus(label, verdict, install?.logs.orEmpty())
+                if (securityTierOf(verdict) == SecurityTier.Yellow) {
+                    val proceed = resolveCautionPrompt(mine, label, pkg, verdict)
+                    if (!proceed) {
+                        return InstallStatus(
+                            working = false,
+                            ok = false,
+                            name = label,
+                            percent = 100,
+                            phase = InstallPhase.Done,
+                            reason = R.string.reason_cancelled,
+                            shieldVerdict = verdict,
+                            logs = install?.logs.orEmpty(),
+                        )
+                    }
+                    userOverridden = true
+                } else {
+                    return shieldBlockedStatus(label, blockedBy(verdict), install?.logs.orEmpty())
+                }
+            }
+            if (!mayInstall(verdict, userOverridden)) {
+                return shieldBlockedStatus(label, blockedBy(verdict), install?.logs.orEmpty())
             }
             withContext(Dispatchers.IO) {
                 runCatching { sourceFile.delete() }
             }
             if (mine != generation) throw CancellationException()
+            performAutoBackup(mine, pkg, shield.installedInfo)
             install = install?.copy(phase = InstallPhase.Sending, percent = 0)
 
             val localAbis = Build.SUPPORTED_ABIS.toList()
@@ -685,6 +1181,12 @@ class ConnectionModel(
                     }
                     is SplitFilterResult.Selected -> {
                         postLog(mine, "> split filter: selected ${filtered.splits.size}/${bundle.apks.size} splits (${filtered.splits.joinToString(", ") { it.name }})")
+                        // Every split that is streamed must still be the file that was checked.
+                        if (verdict != null && !filesUnchangedSinceScan(shield.scanned, filtered.splits.map { it.file })) {
+                            postLog(mine, "> shield: a split changed after it was checked, nothing was installed")
+                            return@blocking BundleOutcome.FailedReason(R.string.reason_file_changed)
+                        }
+                        check(mayInstall(verdict, userOverridden)) { "The shield did not clear this package" }
                         val result = installBundleSession(
                             adb = adb,
                             splits = filtered.splits,
@@ -705,8 +1207,31 @@ class ConnectionModel(
                 is BundleOutcome.Pm -> {
                     appendLog(mine, "> pm: ${outcome.result.line.ifBlank { if (outcome.result.success) "Success" else "Failure" }}")
                     val latestStatus = install ?: status
-                    if (outcome.result.success) latestStatus.copy(working = false, ok = true, percent = 100, phase = InstallPhase.Done)
-                    else failed(latestStatus, pmFailure(outcome.result.line))
+                    val obbFailure = outcome.result.obbFailure
+                    when {
+                        // Installed, but the OBB data files are missing: say so, never a silent success.
+                        outcome.result.success && obbFailure != null -> failed(latestStatus, InstallFailure(R.string.reason_obb_not_copied, obbFailure))
+                        outcome.result.success -> {
+                            var keptUri: Uri? = uri
+                            if (installSettings.deleteApk) {
+                                val deleted = runCatching {
+                                    DocumentsContract.deleteDocument(resolver, uri)
+                                }.getOrDefault(false)
+                                if (deleted) {
+                                    appendLog(mine, "> file: auto-deleted source package after installation")
+                                    keptUri = null
+                                }
+                            }
+                            latestStatus.copy(
+                                working = false,
+                                ok = true,
+                                percent = 100,
+                                phase = InstallPhase.Done,
+                                sourceUri = keptUri,
+                            )
+                        }
+                        else -> failed(latestStatus, pmFailure(outcome.result.line))
+                    }
                 }
             }
         } finally {
@@ -738,6 +1263,28 @@ class ConnectionModel(
                 name to size
             }
     }.getOrNull() ?: (null to null)
+
+    fun deleteSourcePackage() {
+        val uri = install?.sourceUri ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            val app = getApplication<Application>()
+            val deleted = runCatching {
+                DocumentsContract.deleteDocument(app.contentResolver, uri)
+            }.getOrDefault(false)
+            withContext(Dispatchers.Main) {
+                if (deleted) {
+                    install = install?.copy(
+                        sourceUri = null,
+                        logs = install?.logs.orEmpty() + "> file: deleted source package from storage",
+                    )
+                } else {
+                    install = install?.copy(
+                        logs = install?.logs.orEmpty() + "> file: unable to delete (storage permission or provider does not allow deletion)",
+                    )
+                }
+            }
+        }
+    }
 
     fun installUnavailable() {
         install = InstallStatus(false, reason = R.string.err_no_picker)

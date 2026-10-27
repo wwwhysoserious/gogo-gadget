@@ -184,6 +184,11 @@ class MainActivity : ComponentActivity() {
                                 onAllowNotifications = ::allowNotifications,
                                 onOpenDeveloperOptions = ::openDeveloperOptions,
                                 onInfoToggle = { infoOpen = !infoOpen },
+                                onConfirmUpload = model::confirmUpload,
+                                onCancelUpload = model::cancelUpload,
+                                onConfirmCaution = model::confirmCaution,
+                                onCancelCaution = model::cancelCaution,
+                                onDeleteSource = model::deleteSourcePackage,
                                 onButton = { action ->
                                     when (action) {
                                         ButtonAction.ChooseDevice -> devicesOpen = true
@@ -196,7 +201,18 @@ class MainActivity : ComponentActivity() {
                                     }
                                 },
                             )
-                            Tab.Backups -> BackupsScreen(palette)
+                            Tab.Backups -> BackupsScreen(
+                                palette = palette,
+                                backups = model.backups,
+                                isWorking = model.install?.working == true,
+                                onRevert = { backup ->
+                                    model.revertBackup(backup)
+                                    tab = Tab.Install
+                                },
+                                onDelete = { backup ->
+                                    model.deleteBackup(backup.packageName)
+                                },
+                            )
                             Tab.Settings -> SettingsScreen(
                                 palette = palette,
                                 selected = setting,

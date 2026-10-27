@@ -6,13 +6,14 @@ import android.content.pm.PackageManager
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import kotlinx.coroutines.CancellationException
+import org.json.JSONException
+import org.json.JSONObject
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.InputStream
 import java.io.RandomAccessFile
 import java.net.HttpURLConnection
-import java.net.URL
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.security.KeyStore
@@ -29,13 +30,18 @@ import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 
 // Phase 4: Antivirus shield — streaming SHA-256, offline signature & manifest analysis,
-// VirusTotal v3 hash lookup, verdict evaluation, and Keystore-encrypted shield settings.
+// VirusTotal v3 hash lookup (upload and analysis are in VirusTotal.kt), verdict evaluation, and Keystore-encrypted shield settings.
 
 private const val HashBufferBytes = 64 * 1024
 private const val MaxManifestBytes = 4 * 1024 * 1024
 private const val MaxCertEntryBytes = 512 * 1024
-private const val MaxVtResponseBytes = 256 * 1024
-const val MaxDeepScanBytes = 32L * 1024L * 1024L
+internal const val MaxVtResponseBytes = 256 * 1024
+
+/** A file with fewer analysing engines than this is not trusted, even when none of them flags it. */
+const val MinVtEngines = 20
+
+/** The largest file that is offered for upload to VirusTotal (its API limit for the large-file upload URL). */
+const val MaxVtUploadBytes = 650L * 1024L * 1024L
 
 /** High-risk manifest permissions scanned offline in `AndroidManifest.xml`. */
 val HighRiskPermissions: List<String> = listOf(
@@ -77,14 +83,10 @@ private val KnownDebugOrTestDnTokens: List<String> = listOf(
 )
 
 // All Regex patterns escape literal `{`, `}`, `[`, and `]` outside character classes for Android ICU compatibility.
-private val VtStatsBlockRegex = Regex(""""last_analysis_stats"\s*:\s*\{([^{}]*)\}""")
-private val VtMaliciousRegex = Regex(""""malicious"\s*:\s*(\d+)""")
-private val VtSuspiciousRegex = Regex(""""suspicious"\s*:\s*(\d+)""")
-private val VtHarmlessRegex = Regex(""""harmless"\s*:\s*(\d+)""")
-private val VtUndetectedRegex = Regex(""""undetected"\s*:\s*(\d+)""")
 private val VersionCodeXmlRegex = Regex("""(?i)versionCode\s*=\s*"?(\d+)"?""")
 private val VersionCodeJsonRegex = Regex("""(?i)"(?:version_code|versioncode)"\s*:\s*"?(\d+)"?""")
 private val DumpsysVersionCodeRegex = Regex("""\bversionCode=(\d+)""")
+private val DumpsysVersionNameRegex = Regex("""\bversionName=([^\s]+)""")
 private val DumpsysCertSha256Regex = Regex("""(?i)(?:sha-?256|cert-sha256)\s*[:=]\s*([0-9a-f]{2}(?::[0-9a-f]{2}){31}|[0-9a-f]{64})""")
 private val ColonRegex = Regex(":")
 
@@ -130,6 +132,55 @@ enum class ShieldWarningReason {
     DebugOrTestCertificate,
     SignatureMismatch,
     VersionDowngrade,
+    VirusTotalKeyMissing,
+    NotKnownToVirusTotal,
+    VirusTotalUnreachable,
+    TooFewEngines,
+    TooLargeToVerify,
+    PackageMismatch,
+    DropperDetected,
+    AdwareDetected,
+    AbusivePermissions,
+    SelfUpdaterPermission,
+}
+
+enum class SecurityTier { Green, Yellow, Red }
+
+enum class SecuritySeverity { Red, Yellow }
+
+/**
+ * Categorizes security verdict reasons into 3-Color Security Tiers:
+ * - RED (Critical / Hard Block): MalwareDetected, AdwareDetected, SignatureMismatch,
+ *   AbusivePermissions, UnsignedPackage, PackageMismatch, VersionDowngrade, VirusTotalUnreachable,
+ *   TooFewEngines, TooLargeToVerify. Hard block, no override button. Protected fail-closed.
+ * - YELLOW (Caution / Mod Risk / User Decision): DropperDetected, DebugOrTestCertificate,
+ *   NotKnownToVirusTotal, VirusTotalKeyMissing. Suspends and presents CautionPrompt.
+ */
+fun ShieldWarningReason.severity(): SecuritySeverity = when (this) {
+    ShieldWarningReason.DropperDetected,
+    ShieldWarningReason.DebugOrTestCertificate,
+    ShieldWarningReason.NotKnownToVirusTotal,
+    ShieldWarningReason.SelfUpdaterPermission,
+    ShieldWarningReason.VirusTotalKeyMissing -> SecuritySeverity.Yellow
+    else -> SecuritySeverity.Red
+}
+
+/**
+ * Returns the overall security tier of a [ShieldVerdict]:
+ * - Green: proven clean
+ * - Yellow: all warning reasons are Yellow severity
+ * - Red: at least one reason is Red severity (fail-closed)
+ */
+fun securityTierOf(verdict: ShieldVerdict): SecurityTier = when (verdict) {
+    is ShieldVerdict.Clean -> SecurityTier.Green
+    is ShieldVerdict.NeedsUpload -> SecurityTier.Yellow
+    is ShieldVerdict.Warning -> {
+        if (verdict.reasons.any { it.severity() == SecuritySeverity.Red }) {
+            SecurityTier.Red
+        } else {
+            SecurityTier.Yellow
+        }
+    }
 }
 
 data class OfflineScanReport(
@@ -143,31 +194,38 @@ data class OfflineScanReport(
     val reasons: List<ShieldWarningReason>,
     val allPermissions: List<String> = emptyList(),
     val certSubject: String? = null,
+    val issueDetail: String? = null,
 )
 
 sealed interface VtLookupResult {
-    data class Found(val malicious: Int, val suspicious: Int, val total: Int) : VtLookupResult
+    /** [lastAnalysisDate] is epoch seconds, null when VirusTotal did not say. */
+    data class Found(val malicious: Int, val suspicious: Int, val total: Int, val lastAnalysisDate: Long? = null) : VtLookupResult
     data object UnknownHash : VtLookupResult
     data object InvalidKey : VtLookupResult
     data object RateLimited : VtLookupResult
     data object Unavailable : VtLookupResult
 }
 
-enum class ShieldStatusKind { VerifiedWithVt, OfflineNoKey, OfflineVtIssue }
+enum class ShieldStatusKind { VerifiedWithVt, TrustedUpdate }
 
-fun shieldStatusKind(vtSummary: String?): ShieldStatusKind = when {
-    vtSummary == null -> ShieldStatusKind.OfflineNoKey
-    vtSummary.contains('/') -> ShieldStatusKind.VerifiedWithVt
-    else -> ShieldStatusKind.OfflineVtIssue
-}
+fun shieldStatusKind(verdict: ShieldVerdict.Clean): ShieldStatusKind =
+    if (verdict.trustedUpdate) ShieldStatusKind.TrustedUpdate else ShieldStatusKind.VerifiedWithVt
+
+/** What VirusTotal said about one APK of the package (a bundle has one entry per split). */
+data class ShieldFileEvidence(val name: String, val sizeBytes: Long, val sha256: String, val vt: VtLookupResult)
+
+/** A file VirusTotal does not know yet, which the user may choose to upload. */
+data class UploadCandidate(val name: String, val sizeBytes: Long, val sha256: String)
 
 sealed interface ShieldVerdict {
     val offline: OfflineScanReport?
 
+    /** No engine flags the package ([vtSummary] like `0/62`, null when a trusted update was not looked up). */
     data class Clean(
         val sha256: String,
         val vtSummary: String?,
         override val offline: OfflineScanReport? = null,
+        val trustedUpdate: Boolean = false,
     ) : ShieldVerdict
 
     data class Warning(
@@ -177,58 +235,72 @@ sealed interface ShieldVerdict {
         val vtTotal: Int,
         override val offline: OfflineScanReport? = null,
     ) : ShieldVerdict
+
+    /** Safety is not proven yet: these files can be sent to VirusTotal, after the user agrees. */
+    data class NeedsUpload(
+        val sha256: String,
+        val files: List<UploadCandidate>,
+        override val offline: OfflineScanReport? = null,
+    ) : ShieldVerdict
 }
 
-/** Evaluates the final [ShieldVerdict] from the package [sha256], [offline] scan report, and optional [vt] result. */
+/**
+ * An update of the installed app: it is signed with the same certificate as the installed one, its version is not
+ * older, and the offline scan found nothing wrong.
+ */
+fun isTrustedUpdate(offline: OfflineScanReport, installed: InstalledAppInfo?): Boolean {
+    val installedSig = installed?.sigSha256?.normalizeHexSha256() ?: return false
+    val installedVersion = installed.versionCode ?: return false
+    val candidateSig = offline.signerSha256?.normalizeHexSha256() ?: return false
+    val candidateVersion = offline.versionCode ?: return false
+    return offline.reasons.isEmpty() && candidateSig == installedSig && candidateVersion >= installedVersion
+}
+
+private fun vtSummaryOf(found: List<VtLookupResult.Found>): String? {
+    val fewest = found.minByOrNull { it.total } ?: return null
+    val base = "${fewest.malicious + fewest.suspicious}/${fewest.total}"
+    return if (found.size > 1) "$base, ${found.size} files" else base
+}
+
+/**
+ * Decides whether the package is proven clean; anything that is not proven is blocked. Rules, first match wins:
+ * offline problems, a flagged file, a trusted update, no key, VirusTotal unreachable, too few engines, an unknown
+ * file (too large, or [ShieldVerdict.NeedsUpload]), and finally every file known and clean.
+ */
 fun evaluateShieldVerdict(
     sha256: String,
     offline: OfflineScanReport,
-    vt: VtLookupResult? = null,
-    deepScanEnabled: Boolean = false,
-    fileSizeBytes: Long = 0L,
+    hasKey: Boolean,
+    trustedUpdate: Boolean,
+    files: List<ShieldFileEvidence>,
 ): ShieldVerdict {
-    val reasons = mutableListOf<ShieldWarningReason>()
-    var vtMalicious = 0
-    var vtTotal = 0
-    var vtSummary: String? = null
+    fun warning(vararg reasons: ShieldWarningReason, malicious: Int = 0, total: Int = 0) =
+        ShieldVerdict.Warning(sha256, reasons.toList(), malicious, total, offline)
 
-    when (vt) {
-        is VtLookupResult.Found -> {
-            vtMalicious = vt.malicious + vt.suspicious
-            vtTotal = vt.total
-            vtSummary = "$vtMalicious/${vt.total}"
-            if (vt.malicious > 0 || vt.suspicious > 0) {
-                reasons += ShieldWarningReason.MalwareDetected
-            }
-        }
-        VtLookupResult.UnknownHash -> {
-            vtSummary = if (deepScanEnabled && fileSizeBytes in 1L..MaxDeepScanBytes) {
-                "unknown (deep scan eligible)"
-            } else {
-                "unknown"
-            }
-        }
-        VtLookupResult.InvalidKey -> vtSummary = "invalid key"
-        VtLookupResult.RateLimited -> vtSummary = "rate limited"
-        VtLookupResult.Unavailable -> vtSummary = "unavailable"
-        null -> vtSummary = null
+    if (offline.reasons.isNotEmpty()) return ShieldVerdict.Warning(sha256, offline.reasons, 0, 0, offline)
+
+    val found = files.mapNotNull { it.vt as? VtLookupResult.Found }
+    val flagged = found.filter { it.malicious > 0 || it.suspicious > 0 }
+        .maxByOrNull { it.malicious + it.suspicious }
+    if (flagged != null) {
+        return warning(ShieldWarningReason.MalwareDetected, malicious = flagged.malicious + flagged.suspicious, total = flagged.total)
     }
 
-    for (reason in offline.reasons) {
-        if (reason !in reasons) reasons += reason
-    }
+    if (trustedUpdate) return ShieldVerdict.Clean(sha256, vtSummaryOf(found), offline, trustedUpdate = true)
 
-    return if (reasons.isEmpty()) {
-        ShieldVerdict.Clean(sha256 = sha256, vtSummary = vtSummary, offline = offline)
-    } else {
-        ShieldVerdict.Warning(
-            sha256 = sha256,
-            reasons = reasons,
-            vtMalicious = vtMalicious,
-            vtTotal = vtTotal,
-            offline = offline,
-        )
+    if (!hasKey) return warning(ShieldWarningReason.VirusTotalKeyMissing)
+    val unreachable = files.isEmpty() || files.any {
+        it.vt == VtLookupResult.Unavailable || it.vt == VtLookupResult.RateLimited || it.vt == VtLookupResult.InvalidKey
     }
+    if (unreachable) return warning(ShieldWarningReason.VirusTotalUnreachable)
+    if (found.any { it.total < MinVtEngines }) return warning(ShieldWarningReason.TooFewEngines)
+
+    val unknown = files.filter { it.vt == VtLookupResult.UnknownHash }
+    if (unknown.isNotEmpty()) {
+        if (unknown.any { it.sizeBytes > MaxVtUploadBytes }) return warning(ShieldWarningReason.TooLargeToVerify)
+        return ShieldVerdict.NeedsUpload(sha256, unknown.map { UploadCandidate(it.name, it.sizeBytes, it.sha256) }, offline)
+    }
+    return ShieldVerdict.Clean(sha256, vtSummaryOf(found), offline)
 }
 
 // ---- Offline APK & Bundle analysis ----
@@ -301,6 +373,9 @@ fun analyzePackageOffline(
         allSigned = false
     }
 
+    // Nothing here verifies a signature (pm does), but a package whose signer certificate cannot be read at all is not trusted.
+    if (primarySignerSha256 == null) allSigned = false
+
     if (primarySignerSha256 != null && primarySignerSha256 in KnownTestKeySha256s) {
         anyDebugOrTest = true
     }
@@ -369,10 +444,7 @@ private fun inspectExtractedApk(extracted: ExtractedFile): SingleApkInspection {
 }
 
 private fun inspectSingleApkFile(apkFile: File): SingleApkInspection {
-    var hasV1Sig = false
-    var debugOrTest = false
-    var signerSha256: String? = null
-    var certSubject: String? = null
+    val v1Certs = mutableListOf<ParsedCertInfo>()
     var versionCode: Long? = null
     val riskPerms = LinkedHashSet<String>()
     val allPerms = LinkedHashSet<String>()
@@ -407,37 +479,34 @@ private fun inspectSingleApkFile(apkFile: File): SingleApkInspection {
         for (sigEntry in sigEntries) {
             val certBytes = zip.getInputStream(sigEntry).use { readBoundedBytes(it, MaxCertEntryBytes) }
             val parsed = parseCertificateBytes(certBytes)
-            if (parsed != null) {
-                hasV1Sig = true
-                if (signerSha256 == null) signerSha256 = parsed.sha256
-                if (certSubject == null) certSubject = parsed.subject
-                if (parsed.debugOrTest) debugOrTest = true
-            }
+            if (parsed != null) v1Certs += parsed
         }
     }
 
     val v2v3 = inspectApkSigningBlock(apkFile)
-    val hasV2V3Sig = v2v3.present
-    if (v2v3.signerSha256 != null && signerSha256 == null) {
-        signerSha256 = v2v3.signerSha256
-    }
-    if (v2v3.certSubject != null && certSubject == null) {
-        certSubject = v2v3.certSubject
-    }
-    if (v2v3.debugOrTest) {
-        debugOrTest = true
-    }
+    val facts = mergeSignerFacts(v1Certs, v2v3.certs)
 
     return SingleApkInspection(
-        signed = hasV1Sig || hasV2V3Sig,
-        debugOrTestSigned = debugOrTest,
-        signerSha256 = signerSha256,
-        certSubject = certSubject,
+        signed = v1Certs.isNotEmpty() || v2v3.present,
+        debugOrTestSigned = facts.debugOrTest,
+        signerSha256 = facts.signerSha256,
+        certSubject = facts.certSubject,
         versionCode = versionCode,
         highRiskPermissions = riskPerms,
         allPermissions = allPerms.sorted(),
     )
 }
+
+internal data class SignerFacts(val signerSha256: String?, val certSubject: String?, val debugOrTest: Boolean)
+
+/** The v2/v3 signer wins over a v1 certificate (the platform checks v2/v3 first); a test key among ANY certificate flags the package. */
+internal fun mergeSignerFacts(v1: List<ParsedCertInfo>, v2v3: List<ParsedCertInfo>): SignerFacts {
+    val primary = v2v3.firstOrNull() ?: v1.firstOrNull()
+    return SignerFacts(primary?.sha256, primary?.subject, (v1 + v2v3).any { it.debugOrTest })
+}
+
+/** True when ANY of the DER [certs] is a public test/debug key. */
+internal fun anyCertDebugOrTest(certs: List<ByteArray>): Boolean = certs.any { parseCertificateBytes(it)?.debugOrTest == true }
 
 private fun isV1SignatureBlockEntry(normalizedPath: String): Boolean {
     if (!normalizedPath.startsWith("META-INF/", ignoreCase = true)) return false
@@ -524,14 +593,12 @@ private fun extractEmbeddedDerCert(cf: CertificateFactory, rawBytes: ByteArray):
 
 private data class ApkSigningBlockInfo(
     val present: Boolean,
-    val signerSha256: String? = null,
-    val certSubject: String? = null,
-    val debugOrTest: Boolean = false,
+    val certs: List<ParsedCertInfo> = emptyList(),
 )
 
 private data class V2V3PairsExtraction(
     val hasSchemeId: Boolean,
-    val certInfo: ParsedCertInfo?,
+    val certs: List<ParsedCertInfo>,
 )
 
 private val ApkSigBlockMagic = "APK Sig Block 42".toByteArray(Charsets.US_ASCII)
@@ -581,8 +648,7 @@ private fun inspectApkSigningBlock(apkFile: File): ApkSigningBlockInfo {
                             val extracted = extractV2V3CertFromPairs(pairsBytes)
                             return ApkSigningBlockInfo(
                                 present = extracted.hasSchemeId,
-                                signerSha256 = extracted.certInfo?.sha256,
-                                debugOrTest = extracted.certInfo?.debugOrTest == true,
+                                certs = extracted.certs,
                             )
                         }
                     }
@@ -598,6 +664,7 @@ private fun inspectApkSigningBlock(apkFile: File): ApkSigningBlockInfo {
 private fun extractV2V3CertFromPairs(pairsBytes: ByteArray): V2V3PairsExtraction {
     val buf = ByteBuffer.wrap(pairsBytes).order(ByteOrder.LITTLE_ENDIAN)
     var hasSchemeId = false
+    val certs = mutableListOf<ParsedCertInfo>()
     while (buf.remaining() >= 12) {
         val pairLen = buf.long
         if (pairLen < 4L || pairLen > buf.remaining()) break
@@ -607,37 +674,47 @@ private fun extractV2V3CertFromPairs(pairsBytes: ByteArray): V2V3PairsExtraction
             hasSchemeId = true
             val valueBytes = ByteArray(pairLen.toInt() - 4)
             buf.get(valueBytes)
-            extractFirstX509FromSchemeBlock(valueBytes)?.let {
-                return V2V3PairsExtraction(hasSchemeId = true, certInfo = it)
-            }
+            certs += extractX509sFromSchemeBlock(valueBytes)
         }
         buf.position(nextPairPos)
     }
-    return V2V3PairsExtraction(hasSchemeId = hasSchemeId, certInfo = null)
+    return V2V3PairsExtraction(hasSchemeId = hasSchemeId, certs = certs)
 }
 
-private fun extractFirstX509FromSchemeBlock(blockBytes: ByteArray): ParsedCertInfo? {
-    return try {
+/** Every certificate of every signer in a v2/v3 scheme block, in file order; whatever was readable before a malformed part. */
+private fun extractX509sFromSchemeBlock(blockBytes: ByteArray): List<ParsedCertInfo> {
+    val found = mutableListOf<ParsedCertInfo>()
+    try {
         val buf = ByteBuffer.wrap(blockBytes).order(ByteOrder.LITTLE_ENDIAN)
         val signersLen = buf.int
-        if (signersLen <= 0 || signersLen > buf.remaining()) return null
-        val firstSignerLen = buf.int
-        if (firstSignerLen <= 0 || firstSignerLen > buf.remaining()) return null
-        val signedDataLen = buf.int
-        if (signedDataLen <= 0 || signedDataLen > buf.remaining()) return null
-        val digestsLen = buf.int
-        if (digestsLen < 0 || digestsLen > buf.remaining()) return null
-        buf.position(buf.position() + digestsLen)
-        val certsLen = buf.int
-        if (certsLen <= 4 || certsLen > buf.remaining()) return null
-        val firstCertLen = buf.int
-        if (firstCertLen <= 0 || firstCertLen > buf.remaining()) return null
-        val certBytes = ByteArray(firstCertLen)
-        buf.get(certBytes)
-        parseCertificateBytes(certBytes)
+        if (signersLen <= 0 || signersLen > buf.remaining()) return found
+        val signersEnd = buf.position() + signersLen
+        while (buf.position() + 4 <= signersEnd) {
+            val signerLen = buf.int
+            if (signerLen <= 0 || signerLen > signersEnd - buf.position()) break
+            val signerEnd = buf.position() + signerLen
+            val signedDataLen = buf.int
+            if (signedDataLen <= 0 || signedDataLen > signerEnd - buf.position()) break
+            val signedDataEnd = buf.position() + signedDataLen
+            val digestsLen = buf.int
+            if (digestsLen < 0 || digestsLen > signedDataEnd - buf.position()) break
+            buf.position(buf.position() + digestsLen)
+            val certsLen = buf.int
+            if (certsLen < 0 || certsLen > signedDataEnd - buf.position()) break
+            val certsEnd = buf.position() + certsLen
+            while (buf.position() + 4 <= certsEnd) {
+                val certLen = buf.int
+                if (certLen <= 0 || certLen > certsEnd - buf.position()) break
+                val certBytes = ByteArray(certLen)
+                buf.get(certBytes)
+                parseCertificateBytes(certBytes)?.let { found += it }
+            }
+            buf.position(signerEnd)
+        }
     } catch (_: Throwable) {
-        null
+        // Keep what was read.
     }
+    return found
 }
 
 /**
@@ -854,7 +931,7 @@ private fun readUInt32Le(bytes: ByteArray, offset: Int): Long =
         ((bytes[offset + 2].toLong() and 0xFFL) shl 16) or
         ((bytes[offset + 3].toLong() and 0xFFL) shl 24)
 
-private fun readBoundedBytes(input: InputStream, maxBytes: Int): ByteArray {
+internal fun readBoundedBytes(input: InputStream, maxBytes: Int): ByteArray {
     val out = ByteArrayOutputStream()
     val buf = ByteArray(8192)
     var remaining = maxBytes
@@ -869,6 +946,12 @@ private fun readBoundedBytes(input: InputStream, maxBytes: Int): ByteArray {
     return out.toByteArray()
 }
 
+/** The response body as text, or null when it is longer than [MaxVtResponseBytes]: a cut body is never parsed. */
+internal fun readVtBody(input: InputStream): String? {
+    val bytes = readBoundedBytes(input, MaxVtResponseBytes + 1)
+    return if (bytes.size > MaxVtResponseBytes) null else bytes.toString(Charsets.UTF_8)
+}
+
 // ---- Installed package info from ADB `dumpsys package <pkg>` & local PackageManager ----
 
 data class InstalledAppInfo(
@@ -876,13 +959,16 @@ data class InstalledAppInfo(
     val sigSha256: String?,
     val debugOrTestSigned: Boolean = false,
     val certSubject: String? = null,
+    val appName: String? = null,
+    val versionName: String? = null,
 )
 
 /** Parses `dumpsys package <pkg>` output for `versionCode` and optional signer SHA-256. */
 fun parseDumpsysInstalledApp(dumpsysOutput: String): InstalledAppInfo {
     val versionCode = DumpsysVersionCodeRegex.find(dumpsysOutput)?.groupValues?.get(1)?.toLongOrNull()
     val sigSha256 = DumpsysCertSha256Regex.find(dumpsysOutput)?.groupValues?.get(1)?.normalizeHexSha256()
-    return InstalledAppInfo(versionCode = versionCode, sigSha256 = sigSha256)
+    val versionName = DumpsysVersionNameRegex.find(dumpsysOutput)?.groupValues?.get(1)
+    return InstalledAppInfo(versionCode = versionCode, sigSha256 = sigSha256, versionName = versionName)
 }
 
 /**
@@ -901,6 +987,8 @@ fun queryInstalledAppInfo(
 
     var versionCode = parsed.versionCode
     var sigSha256 = parsed.sigSha256
+    var versionName = parsed.versionName
+    var appName: String? = null
 
     if (localContext != null) {
         try {
@@ -909,6 +997,8 @@ fun queryInstalledAppInfo(
                 PackageManager.GET_SIGNING_CERTIFICATES,
             )
             if (versionCode == null) versionCode = info.longVersionCode
+            if (versionName == null) versionName = info.versionName
+            appName = runCatching { info.applicationInfo?.loadLabel(localContext.packageManager)?.toString() }.getOrNull()
             if (sigSha256 == null) {
                 val signer = info.signingInfo?.let { si ->
                     if (si.hasMultipleSigners()) si.apkContentsSigners?.firstOrNull()
@@ -922,7 +1012,12 @@ fun queryInstalledAppInfo(
             // Package is not installed locally or could not be queried.
         }
     }
-    return InstalledAppInfo(versionCode = versionCode, sigSha256 = sigSha256)
+    return InstalledAppInfo(
+        versionCode = versionCode,
+        sigSha256 = sigSha256,
+        appName = appName,
+        versionName = versionName,
+    )
 }
 
 /** Extracts the signing certificate SHA-256 and `longVersionCode` from an APK file via Android [PackageManager]. */
@@ -939,10 +1034,11 @@ fun queryArchiveAppInfo(context: Context, apkFile: File): InstalledAppInfo {
         val signerBytes = signer?.toByteArray()
         val parsedCert = signerBytes?.let(::parseCertificateBytes)
         val sigSha256 = parsedCert?.sha256 ?: signerBytes?.let { sha256Hex(ByteArrayInputStream(it)) }
+        val allSigners = info.signingInfo?.apkContentsSigners.orEmpty().map { it.toByteArray() }
         InstalledAppInfo(
             versionCode = info.longVersionCode,
             sigSha256 = sigSha256,
-            debugOrTestSigned = parsedCert?.debugOrTest == true,
+            debugOrTestSigned = parsedCert?.debugOrTest == true || anyCertDebugOrTest(allSigners),
             certSubject = parsedCert?.subject,
         )
     } catch (_: Throwable) {
@@ -953,57 +1049,78 @@ fun queryArchiveAppInfo(context: Context, apkFile: File): InstalledAppInfo {
 // ---- VirusTotal API v3 hash lookup & response parser ----
 
 /**
+ * Reads the engine counts (`malicious`, `suspicious`, `harmless`, `undetected`) out of a stats object; null when none is
+ * there or one is not a non-negative number.
+ */
+internal fun vtStatsToFound(stats: JSONObject, lastAnalysisDate: Long? = null): VtLookupResult.Found? {
+    val counts = listOf("malicious", "suspicious", "harmless", "undetected").map { key ->
+        if (!stats.has(key)) {
+            null
+        } else {
+            stats.optInt(key, -1).takeIf { it >= 0 } ?: return null
+        }
+    }
+    if (counts.all { it == null }) return null
+    return VtLookupResult.Found(
+        malicious = counts[0] ?: 0,
+        suspicious = counts[1] ?: 0,
+        total = counts.sumOf { it ?: 0 },
+        lastAnalysisDate = lastAnalysisDate,
+    )
+}
+
+/**
  * Pure JSON parser for VirusTotal v3 `GET /api/v3/files/{sha256}` responses:
- * - `200`: extracts `last_analysis_stats` (`malicious`, `suspicious`, `harmless`, `undetected`) -> [VtLookupResult.Found]
+ * - `200`: needs `data.id` equal to [sha256], `data.attributes.last_analysis_stats` and `data.attributes.last_analysis_date`;
+ *   the counters come only from `last_analysis_stats` -> [VtLookupResult.Found]
  * - `404`: [VtLookupResult.UnknownHash]
  * - `401` / `403`: [VtLookupResult.InvalidKey]
  * - `429`: [VtLookupResult.RateLimited]
- * - Any other status or malformed JSON: [VtLookupResult.Unavailable]
+ * - Any other status (redirects included), a mismatch, or malformed JSON: [VtLookupResult.Unavailable]
  */
-fun parseVirusTotalResponse(httpCode: Int, body: String): VtLookupResult = when (httpCode) {
-    200 -> {
-        val statsSection = VtStatsBlockRegex.find(body)?.groupValues?.get(1) ?: body
-        val malicious = VtMaliciousRegex.find(statsSection)?.groupValues?.get(1)?.toIntOrNull()
-        val suspicious = VtSuspiciousRegex.find(statsSection)?.groupValues?.get(1)?.toIntOrNull()
-        val harmless = VtHarmlessRegex.find(statsSection)?.groupValues?.get(1)?.toIntOrNull()
-        val undetected = VtUndetectedRegex.find(statsSection)?.groupValues?.get(1)?.toIntOrNull()
-        if (malicious == null && suspicious == null && harmless == null && undetected == null) {
-            VtLookupResult.Unavailable
-        } else {
-            val m = malicious ?: 0
-            val s = suspicious ?: 0
-            val h = harmless ?: 0
-            val u = undetected ?: 0
-            VtLookupResult.Found(malicious = m, suspicious = s, total = m + s + h + u)
-        }
-    }
+fun parseVirusTotalResponse(httpCode: Int, body: String, sha256: String): VtLookupResult = when (httpCode) {
+    200 -> parseVirusTotalFile(body, sha256)
     404 -> VtLookupResult.UnknownHash
     401, 403 -> VtLookupResult.InvalidKey
     429 -> VtLookupResult.RateLimited
     else -> VtLookupResult.Unavailable
 }
 
+private fun parseVirusTotalFile(body: String, sha256: String): VtLookupResult = try {
+    val data = JSONObject(body).getJSONObject("data")
+    val attributes = data.getJSONObject("attributes")
+    val stats = attributes.getJSONObject("last_analysis_stats")
+    val date = attributes.optLong("last_analysis_date", -1L).takeIf { it > 0L }
+    if (!data.optString("id").equals(sha256, ignoreCase = true) || date == null) VtLookupResult.Unavailable
+    else vtStatsToFound(stats, date) ?: VtLookupResult.Unavailable
+} catch (_: JSONException) {
+    VtLookupResult.Unavailable
+}
+
+/** `analysed 3 days ago` for the terminal log; the age is shown, never used to decide. */
+internal fun analysisAgeText(lastAnalysisDate: Long?, nowEpochSeconds: Long): String {
+    if (lastAnalysisDate == null) return "analysis date unknown"
+    val days = ((nowEpochSeconds - lastAnalysisDate) / 86_400L).coerceAtLeast(0L)
+    return when (days) {
+        0L -> "analysed today"
+        1L -> "analysed 1 day ago"
+        else -> "analysed $days days ago"
+    }
+}
+
 /**
  * Queries VirusTotal v3 (`GET https://www.virustotal.com/api/v3/files/$sha256`) with header `x-apikey: $apiKey`.
- * Never throws: any network or I/O error returns [VtLookupResult.Unavailable] so offline shield is never blocked.
+ * Never throws: any network or I/O error returns [VtLookupResult.Unavailable] (which blocks the install).
  */
 fun checkVirusTotalHash(sha256: String, apiKey: String, timeoutMs: Int = 10_000): VtLookupResult {
     val cleanHash = sha256.normalizeHexSha256() ?: return VtLookupResult.Unavailable
     val cleanKey = apiKey.trim().takeIf { it.isNotEmpty() } ?: return VtLookupResult.InvalidKey
     var conn: HttpURLConnection? = null
     return try {
-        conn = (URL("https://www.virustotal.com/api/v3/files/$cleanHash").openConnection() as HttpURLConnection).apply {
-            requestMethod = "GET"
-            connectTimeout = timeoutMs
-            readTimeout = timeoutMs
-            useCaches = false
-            setRequestProperty("Accept", "application/json")
-            setRequestProperty("x-apikey", cleanKey)
-        }
+        conn = openVt("$VtBase/files/$cleanHash", "GET", cleanKey, timeoutMs, timeoutMs)
         val code = conn.responseCode
-        val stream = (if (code in 200..299) conn.inputStream else conn.errorStream)
-        val body = stream?.use { readBoundedBytes(it, MaxVtResponseBytes).toString(Charsets.UTF_8) }.orEmpty()
-        parseVirusTotalResponse(code, body)
+        val body = (if (code in 200..299) conn.inputStream else conn.errorStream)?.use { readVtBody(it) }.orEmpty()
+        parseVirusTotalResponse(code, body, cleanHash)
     } catch (e: CancellationException) {
         throw e
     } catch (_: Throwable) {
@@ -1075,7 +1192,7 @@ class ShieldSettingsStore(
         }
 
     var deepScanEnabled: Boolean
-        get() = runCatching { prefs.getBoolean(KeyDeepScanEnabled, false) }.getOrDefault(false)
+        get() = runCatching { prefs.getBoolean(KeyDeepScanEnabled, true) }.getOrDefault(true)
         set(value) {
             runCatching { prefs.edit().putBoolean(KeyDeepScanEnabled, value).apply() }
         }
@@ -1116,12 +1233,7 @@ class ShieldSettingsStore(
     }
 
     fun clearVirusTotalApiKey() {
-        runCatching {
-            prefs.edit()
-                .remove(KeyVtApiKeyCiphertext)
-                .putBoolean(KeyDeepScanEnabled, false)
-                .apply()
-        }
+        runCatching { prefs.edit().remove(KeyVtApiKeyCiphertext).apply() }
     }
 }
 
@@ -1141,3 +1253,17 @@ private fun getOrCreateAndroidKeystoreAesKey(): SecretKey {
         )
     }.generateKey()
 }
+
+// ---- Re-check before streaming ----
+
+/** A file as the shield saw it: its size and SHA-256 when it was scanned and looked up. */
+data class ScannedFile(val file: File, val sizeBytes: Long, val sha256: String)
+
+/**
+ * True only when every file in [streamed] was scanned and still has the scanned size and SHA-256. A file that is
+ * missing, changed, or was never scanned makes it false (fail closed).
+ */
+internal fun filesUnchangedSinceScan(scanned: List<ScannedFile>, streamed: List<File?>): Boolean =
+    streamed.all { file ->
+        file != null && scanned.any { it.file == file && file.isFile && file.length() == it.sizeBytes && sha256Hex(file) == it.sha256 }
+    }

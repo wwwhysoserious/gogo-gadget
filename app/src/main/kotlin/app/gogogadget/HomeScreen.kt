@@ -25,6 +25,8 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.HorizontalDivider
@@ -55,6 +57,7 @@ import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
@@ -81,7 +84,8 @@ import kotlinx.coroutines.delay
 import kotlin.math.roundToInt
 
 val Margin = 24.dp
-private val PanelHeight = 192.dp
+private val PanelHeight = 234.dp
+private val CardHeight = 420.dp
 private val NodeSize = 64.dp
 private val ProgressInset = 4.dp
 private const val ResultHoldMs = 4_000L
@@ -89,6 +93,8 @@ private const val ResultHoldMs = 4_000L
 @Composable
 fun Divider(palette: Palette) =
     HorizontalDivider(thickness = Dp.Hairline, color = Color(palette.divider))
+
+enum class HomeSlide { Connection, Terminal, Shield }
 
 @Composable
 fun HomeScreen(
@@ -104,6 +110,11 @@ fun HomeScreen(
     onOpenDeveloperOptions: () -> Unit,
     onInfoToggle: () -> Unit,
     onButton: (ButtonAction) -> Unit,
+    onConfirmUpload: (Int) -> Unit,
+    onCancelUpload: (Int) -> Unit,
+    onConfirmCaution: (Int) -> Unit = {},
+    onCancelCaution: (Int) -> Unit = {},
+    onDeleteSource: () -> Unit = {},
 ) {
     val banner = when (palette.banner) {
         Banner.A -> R.drawable.banner_a
@@ -112,42 +123,154 @@ fun HomeScreen(
     }
     val density = LocalDensity.current
     var bannerHeight by rememberSaveable { mutableIntStateOf(0) }
-    val terminalMode = install?.logs?.isNotEmpty() == true
-    val controls: @Composable () -> Unit = {
-        HomeControls(
-            palette, connection, install, infoOpen, pairPort, onCode, onRepost, notificationsOk, onAllowNotifications,
-            onOpenDeveloperOptions, onInfoToggle, onButton, fixedPanel = terminalMode,
-        )
-    }
-    BoxWithConstraints(Modifier.fillMaxSize()) {
-        val viewport = maxHeight
-        if (terminalMode && install != null) {
-            // Fixed page: only the terminal scrolls, and it takes all the height left under the install summary.
-            Column(Modifier.fillMaxSize()) {
-                HomeBanner(palette, banner)
-                Column(Modifier.fillMaxWidth().weight(1f).padding(horizontal = Margin)) {
-                    controls()
-                    Box(Modifier.fillMaxWidth().padding(top = 12.dp)) { InstallSummary(palette, install) }
-                    Spacer(Modifier.height(10.dp))
-                    TerminalLogBox(palette, install.logs, Modifier.weight(1f).heightIn(min = 96.dp))
+
+    val pages = remember(install, connection.state) {
+        buildList {
+            add(HomeSlide.Connection)
+            if (install != null) {
+                add(HomeSlide.Terminal)
+                if (install.cautionPrompt != null || install.uploadPrompt != null) {
+                    add(HomeSlide.Shield)
                 }
             }
-        } else {
-            Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).heightIn(min = viewport)) {
-                HomeBanner(palette, banner, Modifier.onSizeChanged { bannerHeight = it.height })
-                // The composition is centred in the space left under the banner.
-                Box(
-                    Modifier.fillMaxWidth().heightIn(min = viewport - with(density) { bannerHeight.toDp() }),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Column(Modifier.fillMaxWidth().padding(horizontal = Margin)) {
-                        controls()
-                        // Minimum-height slot so the button does not move when the install block appears; wraps if needed.
-                        Box(Modifier.fillMaxWidth().heightIn(min = 48.dp).padding(top = 12.dp)) {
-                            when {
-                                install != null -> InstallSummary(palette, install)
-                                connection.state == ConnectionState.Connected ->
-                                    Text(stringResource(R.string.formats), style = MaterialTheme.typography.bodyMedium, color = Color(palette.secondary))
+        }
+    }
+
+    val pagerState = rememberPagerState(pageCount = { pages.size })
+
+    LaunchedEffect(install?.working) {
+        if (install?.working == true) {
+            val termIdx = pages.indexOf(HomeSlide.Terminal)
+            if (termIdx >= 0) pagerState.animateScrollToPage(termIdx)
+        }
+    }
+
+    LaunchedEffect(install?.cautionPrompt, install?.uploadPrompt) {
+        if (install?.cautionPrompt != null || install?.uploadPrompt != null) {
+            val shieldIdx = pages.indexOf(HomeSlide.Shield)
+            if (shieldIdx >= 0) pagerState.animateScrollToPage(shieldIdx)
+        } else if (pagerState.currentPage >= pages.size) {
+            pagerState.animateScrollToPage((pages.size - 1).coerceAtLeast(0))
+        }
+    }
+
+    LaunchedEffect(install?.working, install?.ok) {
+        if (install != null && !install.working && install.ok) {
+            delay(3500L)
+            if (pagerState.currentPage == pages.indexOf(HomeSlide.Terminal)) {
+                pagerState.animateScrollToPage(0)
+            }
+        }
+    }
+
+    Column(Modifier.fillMaxSize()) {
+        HomeBanner(palette, banner, Modifier.onSizeChanged { bannerHeight = it.height })
+
+        Box(
+            modifier = Modifier.fillMaxWidth().weight(1f).padding(bottom = 60.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                if (pages.size > 1) {
+                    Row(
+                        Modifier.fillMaxWidth().padding(horizontal = Margin, vertical = 8.dp),
+                        horizontalArrangement = Arrangement.Center,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        pages.forEachIndexed { idx, _ ->
+                            val isCurrent = pagerState.currentPage == idx
+                            Box(
+                                Modifier
+                                    .size(width = 24.dp, height = 4.dp)
+                                    .background(Color(if (isCurrent) palette.accent else palette.divider))
+                            )
+                            if (idx < pages.size - 1) Spacer(Modifier.width(6.dp))
+                        }
+                    }
+                }
+
+                HorizontalPager(
+                    state = pagerState,
+                    modifier = Modifier.fillMaxWidth().height(CardHeight),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) { pageIndex ->
+                    val slide = pages.getOrElse(pageIndex) { HomeSlide.Connection }
+                    Box(
+                        Modifier
+                            .fillMaxWidth()
+                            .height(CardHeight)
+                            .padding(horizontal = Margin)
+                            .border(1.dp, Color(palette.divider))
+                            .background(Color(palette.surface))
+                            .padding(14.dp),
+                        contentAlignment = Alignment.TopCenter,
+                    ) {
+                        when (slide) {
+                            HomeSlide.Connection -> {
+                                Column(
+                                    Modifier.fillMaxSize()
+                                        .verticalScroll(rememberScrollState())
+                                ) {
+                                    HomeControls(
+                                        palette, connection, install, infoOpen, pairPort, onCode, onRepost,
+                                        notificationsOk, onAllowNotifications, onOpenDeveloperOptions, onInfoToggle,
+                                        onButton, fixedPanel = true,
+                                    )
+                                    Box(Modifier.fillMaxWidth().padding(top = 8.dp)) {
+                                        if (connection.state == ConnectionState.Connected) {
+                                            Text(
+                                                stringResource(R.string.formats),
+                                                style = MaterialTheme.typography.bodyMedium,
+                                                color = Color(palette.secondary),
+                                                maxLines = 2,
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                            HomeSlide.Terminal -> {
+                                Column(
+                                    Modifier.fillMaxSize()
+                                ) {
+                                    if (install != null) {
+                                        InstallSummary(
+                                            palette = palette,
+                                            install = install,
+                                            onConfirmUpload = onConfirmUpload,
+                                            onCancelUpload = onCancelUpload,
+                                            onConfirmCaution = onConfirmCaution,
+                                            onCancelCaution = onCancelCaution,
+                                            onDeleteSource = onDeleteSource,
+                                        )
+                                        Spacer(Modifier.height(8.dp))
+                                        TerminalLogBox(
+                                            palette = palette,
+                                            logs = install.logs,
+                                            modifier = Modifier.fillMaxSize()
+                                        )
+                                    }
+                                }
+                            }
+                            HomeSlide.Shield -> {
+                                if (install?.cautionPrompt != null) {
+                                    CautionPromptCard(
+                                        palette = palette,
+                                        prompt = install.cautionPrompt,
+                                        verdict = install.shieldVerdict,
+                                        onConfirm = onConfirmCaution,
+                                        onCancel = onCancelCaution,
+                                    )
+                                } else if (install?.uploadPrompt != null) {
+                                    UploadPromptCard(
+                                        palette = palette,
+                                        prompt = install.uploadPrompt,
+                                        onConfirm = onConfirmUpload,
+                                        onCancel = onCancelUpload,
+                                    )
+                                }
                             }
                         }
                     }
@@ -252,11 +375,19 @@ private fun HomeControls(
     }
 }
 
+/** True when the result must say that the shield was off: nothing was checked, and no verdict exists. */
+internal fun shieldOffNote(install: InstallStatus): Boolean = install.shieldOff && install.shieldVerdict == null
+
 /** Package name (or file name) with its result mark, persistent Security Shield status, and any failure reason. */
 @Composable
 private fun InstallSummary(
     palette: Palette,
     install: InstallStatus,
+    onConfirmUpload: (Int) -> Unit,
+    onCancelUpload: (Int) -> Unit,
+    onConfirmCaution: (Int) -> Unit = {},
+    onCancelCaution: (Int) -> Unit = {},
+    onDeleteSource: () -> Unit = {},
 ) {
     Column(Modifier.fillMaxWidth()) {
         if (install.name.isNotEmpty()) {
@@ -300,19 +431,34 @@ private fun InstallSummary(
                 )
             }
         }
-        val showShield = install.shieldChecking || install.shieldVerdict != null
+        val prompt = install.uploadPrompt
+        val caution = install.cautionPrompt
+        val showShield = (install.shieldChecking && prompt == null && caution == null) || (install.shieldVerdict != null && caution == null)
         if (showShield) {
             if (install.name.isNotEmpty()) {
                 Spacer(Modifier.height(6.dp))
             }
             ShieldStatusBlock(
                 palette = palette,
-                checking = install.shieldChecking,
+                checking = install.shieldChecking && prompt == null && caution == null,
                 verdict = install.shieldVerdict,
+                userAuthorized = install.userAuthorized,
             )
         }
+        if (shieldOffNote(install)) {
+            if (install.name.isNotEmpty()) Spacer(Modifier.height(6.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                SecurityShieldIcon(color = Color(palette.secondary), modifier = Modifier.size(16.dp), check = false)
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    stringResource(R.string.shield_off_note),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Color(palette.secondary),
+                )
+            }
+        }
         if (!install.working && !install.ok && install.shieldVerdict !is ShieldVerdict.Warning) {
-            if (showShield || install.name.isNotEmpty()) {
+            if (showShield || shieldOffNote(install) || install.name.isNotEmpty()) {
                 Spacer(Modifier.height(6.dp))
             }
             // Only the plain sentence on the main screen; the raw line stays behind "Details" (diagnostic until v1.0).
@@ -331,6 +477,21 @@ private fun InstallSummary(
                         .heightIn(min = 48.dp).padding(top = 14.dp),
                 )
                 if (open) Text(raw, style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace, color = Color(palette.secondary))
+            }
+        }
+        if (!install.working && install.sourceUri != null) {
+            Spacer(Modifier.height(8.dp))
+            OutlinedButton(
+                onClick = onDeleteSource,
+                modifier = Modifier.fillMaxWidth().height(48.dp),
+                shape = RectangleShape,
+                border = BorderStroke(1.dp, Color(palette.divider)),
+            ) {
+                Text(
+                    stringResource(R.string.delete_source_file),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = Color(palette.error),
+                )
             }
         }
     }
@@ -359,8 +520,9 @@ private fun TerminalLogBox(
         if (logs.size < lastSize) atBottom = true
         lastSize = logs.size
     }
-    LaunchedEffect(scrollState) {
-        snapshotFlow { scrollState.maxValue }.collect { if (atBottom) scrollState.scrollTo(it) }
+    // Always follow the newest line: every new line (and every size change) jumps to the bottom.
+    LaunchedEffect(logs.size) {
+        snapshotFlow { scrollState.maxValue }.collect { scrollState.scrollTo(it) }
     }
     Column(
         modifier.fillMaxWidth()
@@ -406,6 +568,7 @@ private fun TerminalLogBox(
 internal fun SecurityShieldIcon(
     color: Color,
     modifier: Modifier = Modifier.size(18.dp),
+    check: Boolean = true,
 ) {
     Canvas(modifier) {
         val sx = size.width / 24f
@@ -425,13 +588,183 @@ internal fun SecurityShieldIcon(
             close()
         }
         drawPath(shieldPath, color = color, style = Stroke(width = strokeWidth))
-        val checkPath = Path().apply {
-            moveTo(8.2f * sx, 12.2f * sy)
-            lineTo(11.0f * sx, 15.0f * sy)
-            lineTo(16.2f * sx, 9.2f * sy)
+        if (check) {
+            val checkPath = Path().apply {
+                moveTo(8.2f * sx, 12.2f * sy)
+                lineTo(11.0f * sx, 15.0f * sy)
+                lineTo(16.2f * sx, 9.2f * sy)
+            }
+            drawPath(checkPath, color = color, style = Stroke(width = strokeWidth))
         }
-        drawPath(checkPath, color = color, style = Stroke(width = strokeWidth))
     }
+}
+
+/** The question before a file is sent to VirusTotal: compact, flat, buttons 48 dp tall. */
+@Composable
+private fun UploadPromptCard(palette: Palette, prompt: UploadPrompt, onConfirm: (Int) -> Unit, onCancel: (Int) -> Unit) {
+    val accent = Color(palette.accent)
+    val body = LocalContext.current.resources.getQuantityString(
+        R.plurals.shield_upload_body, prompt.fileCount, prompt.fileCount, formatUploadSize(prompt.totalBytes),
+    )
+    Column(
+        Modifier.fillMaxSize()
+            .background(Color(palette.surface))
+            .padding(16.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            SecurityShieldIcon(color = accent, modifier = Modifier.size(16.dp))
+            Spacer(Modifier.width(8.dp))
+            Text(
+                stringResource(R.string.shield_upload_title),
+                style = MaterialTheme.typography.labelLarge,
+                color = Color(palette.text),
+                modifier = Modifier.semantics { heading() },
+            )
+        }
+        Spacer(Modifier.height(12.dp))
+        Box(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState())) {
+            Text(
+                body,
+                style = MaterialTheme.typography.bodyMedium,
+                color = Color(palette.text),
+            )
+        }
+        Spacer(Modifier.height(12.dp))
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(
+                onClick = { onConfirm(prompt.id) },
+                modifier = Modifier.weight(1f).heightIn(min = 48.dp),
+                shape = RectangleShape,
+                colors = ButtonDefaults.buttonColors(),
+                elevation = null,
+            ) { Text(stringResource(R.string.shield_upload_send), style = MaterialTheme.typography.labelLarge) }
+            OutlinedButton(
+                onClick = { onCancel(prompt.id) },
+                modifier = Modifier.weight(1f).heightIn(min = 48.dp),
+                shape = RectangleShape,
+                border = BorderStroke(1.dp, Color(palette.text)),
+            ) { Text(stringResource(R.string.cancel), style = MaterialTheme.typography.labelLarge, color = Color(palette.text)) }
+        }
+    }
+}
+
+/**
+ * Interactive Caution Prompt Card (Yellow Tier):
+ * Yellow/amber accent border, flat, 0 dp radius.
+ * Displays clear frontal title, what was found, real risk explanation, VirusTotal result,
+ * and two action buttons: Cancel (Recommended) and Install Anyway (I Trust This Source).
+ */
+@Composable
+private fun CautionPromptCard(
+    palette: Palette,
+    prompt: CautionPrompt,
+    verdict: ShieldVerdict?,
+    onConfirm: (Int) -> Unit,
+    onCancel: (Int) -> Unit,
+) {
+    val cautionColor = if (palette.isDark) Color(0xFFF59E0B) else Color(0xFFD97706)
+    Column(
+        Modifier.fillMaxSize()
+            .background(Color(palette.surface))
+            .padding(16.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            SecurityShieldIcon(color = cautionColor, modifier = Modifier.size(18.dp), check = false)
+            Spacer(Modifier.width(8.dp))
+            Text(
+                stringResource(R.string.caution_title),
+                style = MaterialTheme.typography.titleMedium,
+                color = cautionColor,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.semantics { heading() },
+            )
+        }
+        Spacer(Modifier.height(10.dp))
+        Column(
+            Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState())
+        ) {
+            // Frontal explanation: describes what was found
+            Text(
+                text = prompt.detail,
+                style = MaterialTheme.typography.bodyMedium,
+                color = Color(palette.text),
+                fontWeight = FontWeight.Medium,
+            )
+            Spacer(Modifier.height(6.dp))
+            // Explains the real risk clearly
+            Text(
+                text = cautionRiskExplanation(prompt.reason),
+                style = MaterialTheme.typography.bodySmall,
+                color = Color(palette.secondary),
+            )
+            Spacer(Modifier.height(8.dp))
+            // Notes VirusTotal result
+            val vtNote = cautionVtNote(verdict)
+            Text(
+                text = vtNote,
+                style = MaterialTheme.typography.bodySmall,
+                fontFamily = FontFamily.Monospace,
+                color = Color(palette.text),
+            )
+        }
+        Spacer(Modifier.height(12.dp))
+        // Two buttons: [ Cancel (Recommended) ] and [ Install Anyway (I Trust This Source) ]
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(
+                onClick = { onCancel(prompt.id) },
+                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                shape = RectangleShape,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Color(palette.buttonContainer),
+                    contentColor = Color(palette.buttonContent),
+                ),
+                elevation = null,
+            ) {
+                Text(
+                    stringResource(R.string.caution_cancel_recommended),
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.Bold,
+                )
+            }
+            OutlinedButton(
+                onClick = { onConfirm(prompt.id) },
+                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                shape = RectangleShape,
+                border = BorderStroke(1.dp, cautionColor),
+            ) {
+                Text(
+                    stringResource(R.string.caution_install_anyway),
+                    style = MaterialTheme.typography.labelLarge,
+                    color = cautionColor,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+internal fun cautionRiskExplanation(reason: ShieldWarningReason): String = when (reason) {
+    ShieldWarningReason.DropperDetected -> stringResource(R.string.caution_dropper_risk)
+    ShieldWarningReason.SelfUpdaterPermission -> stringResource(R.string.caution_self_updater_risk)
+    ShieldWarningReason.DebugOrTestCertificate -> stringResource(R.string.caution_debug_cert_risk)
+    ShieldWarningReason.NotKnownToVirusTotal -> stringResource(R.string.caution_not_known_risk)
+    ShieldWarningReason.VirusTotalKeyMissing -> stringResource(R.string.caution_vt_key_missing_risk)
+    else -> stringResource(R.string.caution_dropper_risk)
+}
+
+@Composable
+internal fun cautionVtNote(verdict: ShieldVerdict?): String = when {
+    verdict is ShieldVerdict.Warning && verdict.vtTotal > 0 -> {
+        if (verdict.vtMalicious > 0) {
+            stringResource(R.string.caution_vt_result, verdict.vtMalicious, verdict.vtTotal)
+        } else {
+            stringResource(R.string.caution_vt_result_zero, verdict.vtTotal)
+        }
+    }
+    verdict is ShieldVerdict.Clean && verdict.vtSummary != null -> {
+        "VirusTotal: ${verdict.vtSummary}"
+    }
+    else -> stringResource(R.string.caution_vt_result_none)
 }
 
 @Composable
@@ -439,6 +772,7 @@ private fun ShieldStatusBlock(
     palette: Palette,
     checking: Boolean,
     verdict: ShieldVerdict?,
+    userAuthorized: Boolean = false,
 ) {
     when {
         checking -> {
@@ -457,15 +791,22 @@ private fun ShieldStatusBlock(
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     SecurityShieldIcon(color = Color(palette.success), modifier = Modifier.size(16.dp))
                     Spacer(Modifier.width(8.dp))
-                    val cleanText = when (shieldStatusKind(verdict.vtSummary)) {
+                    val cleanText = when (shieldStatusKind(verdict)) {
                         ShieldStatusKind.VerifiedWithVt -> stringResource(R.string.shield_status_clean_vt, verdict.vtSummary.orEmpty())
-                        ShieldStatusKind.OfflineNoKey -> stringResource(R.string.shield_status_offline_no_key)
-                        ShieldStatusKind.OfflineVtIssue -> stringResource(R.string.shield_status_offline_vt, verdict.vtSummary.orEmpty())
+                        ShieldStatusKind.TrustedUpdate -> stringResource(R.string.shield_status_trusted_update)
                     }
                     Text(
                         cleanText,
                         style = MaterialTheme.typography.bodyMedium,
                         color = Color(palette.success),
+                    )
+                }
+                if (verdict.trustedUpdate && verdict.vtSummary != null) {
+                    Text(
+                        stringResource(R.string.shield_status_vt_detail, verdict.vtSummary),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color(palette.secondary),
+                        modifier = Modifier.padding(top = 2.dp),
                     )
                 }
                 Text(
@@ -484,21 +825,22 @@ private fun ShieldStatusBlock(
             }
         }
         verdict is ShieldVerdict.Warning -> {
-            val errorColor = Color(palette.error)
+            val isAuth = userAuthorized
+            val statusColor = if (isAuth) Color(palette.accent) else Color(palette.error)
             val textColor = Color(palette.text)
             Column(
                 Modifier.fillMaxWidth()
                     .background(Color(palette.surface))
-                    .border(1.dp, errorColor)
+                    .border(1.dp, statusColor)
                     .padding(12.dp),
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    SecurityShieldIcon(color = errorColor, modifier = Modifier.size(18.dp))
+                    SecurityShieldIcon(color = statusColor, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(8.dp))
                     Text(
-                        stringResource(R.string.shield_status_blocked),
+                        stringResource(if (isAuth) R.string.shield_status_authorized else R.string.shield_status_blocked),
                         style = MaterialTheme.typography.labelLarge,
-                        color = errorColor,
+                        color = statusColor,
                         modifier = Modifier.semantics { heading() },
                     )
                 }
@@ -515,6 +857,26 @@ private fun ShieldStatusBlock(
                             stringResource(R.string.shield_warn_signature)
                         ShieldWarningReason.VersionDowngrade ->
                             stringResource(R.string.shield_warn_downgrade)
+                        ShieldWarningReason.VirusTotalKeyMissing ->
+                            stringResource(R.string.shield_warn_vt_key_missing)
+                        ShieldWarningReason.NotKnownToVirusTotal ->
+                            stringResource(R.string.shield_warn_not_known)
+                        ShieldWarningReason.VirusTotalUnreachable ->
+                            stringResource(R.string.shield_warn_vt_unreachable)
+                        ShieldWarningReason.TooFewEngines ->
+                            stringResource(R.string.shield_warn_few_engines)
+                        ShieldWarningReason.TooLargeToVerify ->
+                            stringResource(R.string.shield_warn_too_large)
+                        ShieldWarningReason.PackageMismatch ->
+                            stringResource(R.string.shield_warn_package_mismatch)
+                        ShieldWarningReason.DropperDetected ->
+                            stringResource(R.string.shield_warn_dropper)
+                        ShieldWarningReason.AdwareDetected ->
+                            stringResource(R.string.shield_warn_adware)
+                        ShieldWarningReason.AbusivePermissions ->
+                            stringResource(R.string.shield_warn_abusive_permissions)
+                        ShieldWarningReason.SelfUpdaterPermission ->
+                            stringResource(R.string.shield_warn_self_updater)
                     }
                     Text(
                         message,
@@ -551,6 +913,8 @@ private fun ProgressButton(palette: Palette, install: InstallStatus, onDismiss: 
         !install.working && install.ok -> stringResource(R.string.status_success)
         !install.working -> stringResource(R.string.status_not_installed)
         install.phase == InstallPhase.Checking -> stringResource(R.string.phase_checking)
+        install.phase == InstallPhase.Uploading -> stringResource(R.string.phase_uploading, install.percent)
+        install.phase == InstallPhase.Analysing -> stringResource(R.string.phase_analysing)
         install.phase == InstallPhase.Installing -> stringResource(R.string.phase_installing)
         else -> stringResource(R.string.phase_sending, install.percent)
     }

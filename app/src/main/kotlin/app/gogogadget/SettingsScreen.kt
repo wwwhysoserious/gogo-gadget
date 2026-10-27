@@ -129,6 +129,7 @@ fun SettingsScreen(
     val shieldStore = remember(context) { ShieldSettingsStore(context) }
     val installStore = remember(context) { InstallSettingsStore(context) }
     var homeShortcut by rememberSaveable { mutableStateOf(installStore.homeShortcut) }
+    var deleteApk by rememberSaveable { mutableStateOf(installStore.deleteApk) }
     var shieldEnabled by rememberSaveable { mutableStateOf(shieldStore.shieldEnabled) }
     var hasVtKey by rememberSaveable { mutableStateOf(shieldStore.hasVirusTotalApiKey()) }
     var deepScanEnabled by rememberSaveable { mutableStateOf(shieldStore.deepScanEnabled) }
@@ -145,7 +146,6 @@ fun SettingsScreen(
             onClear = {
                 shieldStore.clearVirusTotalApiKey()
                 hasVtKey = false
-                deepScanEnabled = false
                 onVtKeyOpen(false)
             },
             onBack = { onVtKeyOpen(false) },
@@ -185,21 +185,17 @@ fun SettingsScreen(
         SettingRow(
             palette = palette,
             name = R.string.virustotal_key,
-            value = s(if (hasVtKey) R.string.virustotal_key_set else R.string.not_set),
+            value = s(if (hasVtKey) R.string.virustotal_key_set else R.string.virustotal_key_required),
             onClick = { onVtKeyOpen(true) },
         )
         SettingRow(
             palette = palette,
             name = R.string.deep_scan,
-            value = s(if (deepScanEnabled && hasVtKey) R.string.on else R.string.off),
-            onClick = if (hasVtKey) {
-                {
-                    val next = !deepScanEnabled
-                    deepScanEnabled = next
-                    shieldStore.deepScanEnabled = next
-                }
-            } else {
-                null
+            value = s(if (deepScanEnabled) R.string.on else R.string.off),
+            onClick = {
+                val next = !deepScanEnabled
+                deepScanEnabled = next
+                shieldStore.deepScanEnabled = next
             },
         )
         GroupHeader(palette, R.string.group_installation)
@@ -213,8 +209,16 @@ fun SettingsScreen(
                 installStore.homeShortcut = next
             },
         )
-        SettingRow(palette, R.string.delete_apk, s(R.string.ask))
-        SettingRow(palette, R.string.play_store_link, s(R.string.off))
+        SettingRow(
+            palette = palette,
+            name = R.string.delete_apk,
+            value = s(if (deleteApk) R.string.on else R.string.off),
+            onClick = {
+                val next = !deleteApk
+                deleteApk = next
+                installStore.deleteApk = next
+            },
+        )
         SettingRow(palette, R.string.backup_before_update, s(R.string.on))
         GroupHeader(palette, R.string.group_language)
         SettingRow(palette, R.string.language, s(R.string.language_value))

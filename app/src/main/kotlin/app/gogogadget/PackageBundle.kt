@@ -6,6 +6,7 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
 import java.io.InputStream
+import java.io.OutputStream
 import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
 import kotlin.math.abs
@@ -53,6 +54,8 @@ data class ExtractedFile(
     val size: Long,
     val file: File? = null,
     val obbPackageName: String? = null,
+    /** Other package names this OBB points at (its `install_path` in the bundle metadata); all must be the base APK's. */
+    val otherPackageClaims: List<String> = emptyList(),
     private val bytes: ByteArray? = null,
 ) {
     fun openStream(): InputStream = when {
@@ -80,6 +83,54 @@ data class ExtractedBundle(
 
 private const val MaxMetadataBytes = 1 shl 20
 private const val CopyBufferBytes = 64 * 1024
+
+/** A package with more entries, or more uncompressed bytes (by its central directory), than this is not checked. */
+internal const val MaxZipEntries = 5000
+internal const val MaxZipUncompressedBytes = 8L * 1024L * 1024L * 1024L
+
+internal fun zipWithinLimits(entryCount: Int, totalUncompressedBytes: Long): Boolean =
+    entryCount in 0..MaxZipEntries && totalUncompressedBytes in 0..MaxZipUncompressedBytes
+
+/** The staging volume needs the bytes to extract plus 5%. */
+internal fun hasRoomToExtract(freeBytes: Long, extractBytes: Long): Boolean = freeBytes >= extractBytes + extractBytes / 20
+
+private fun freeSpaceOf(dir: File): Long =
+    generateSequence(dir) { it.parentFile }.firstOrNull { it.exists() }?.usableSpace ?: 0L
+
+/** Copies at most [limit] bytes (the size the central directory promised); a longer entry is an error. */
+private fun copyBounded(input: InputStream, output: OutputStream, limit: Long): Long {
+    val buffer = ByteArray(CopyBufferBytes)
+    var total = 0L
+    while (true) {
+        val read = input.read(buffer)
+        if (read < 0) break
+        total += read
+        if (total > limit) throw IOException("Zip entry is larger than its central directory says")
+        output.write(buffer, 0, read)
+    }
+    return total
+}
+
+enum class BundlePackageProblem { Mismatch, Unreadable }
+
+/** The package name of a bundle, read from its APK files, and what is wrong with it (null when nothing). */
+data class BundlePackageCheck(val packageName: String?, val problem: BundlePackageProblem?)
+
+/**
+ * The package name comes from the base APK file itself ([basePackage], read by the platform). Metadata in the bundle
+ * ([claimed], from manifest.json / info.json) may only agree with it, and every split must carry the same name.
+ */
+internal fun checkBundlePackage(basePackage: String?, splitPackages: List<String?>, claimed: String?): BundlePackageCheck {
+    if (basePackage == null) return BundlePackageCheck(null, BundlePackageProblem.Unreadable)
+    val readableSplits = splitPackages.filterNotNull()
+    val consistent = readableSplits.all { it == basePackage } && (claimed == null || claimed == basePackage)
+    return BundlePackageCheck(basePackage, if (consistent) null else BundlePackageProblem.Mismatch)
+}
+
+/** True when everything this OBB says about its own package (path, file name, metadata) is [packageName]. */
+internal fun obbBelongsTo(obb: ExtractedFile, packageName: String): Boolean =
+    (listOfNotNull(obb.obbPackageName, extractObbPackageFromPath(obb.name, obb.name)) + obb.otherPackageClaims)
+        .all { it == packageName }
 
 /**
  * Inspects [archiveFile] by content (magic bytes and ZIP central directory) and, when it is a bundle, extracts `.apk`
@@ -113,6 +164,7 @@ fun inspectAndExtractPackage(archiveFile: File, destDir: File? = null): PackageI
     return try {
         ZipFile(archiveFile).use { zip ->
             var entryCount = 0
+            var totalUncompressed = 0L
             var hasRootAndroidManifest = false
             var manifestEntry: ZipEntry? = null
             var infoEntry: ZipEntry? = null
@@ -123,6 +175,8 @@ fun inspectAndExtractPackage(archiveFile: File, destDir: File? = null): PackageI
             while (entries.hasMoreElements()) {
                 val entry = entries.nextElement()
                 entryCount++
+                totalUncompressed += entry.size.let { if (it < 0L) Long.MAX_VALUE / 2 else it }
+                if (!zipWithinLimits(entryCount, totalUncompressed)) return PackageInspectResult.Invalid(R.string.reason_too_complex)
                 val normalizedPath = entry.name.replace('\\', '/').trimStart('/')
                 if (normalizedPath.isEmpty()) continue
                 if (normalizedPath.split('/').any { it == ".." }) {
@@ -172,6 +226,12 @@ fun inspectAndExtractPackage(archiveFile: File, destDir: File? = null): PackageI
             if (hasRootAndroidManifest || apkEntries.isEmpty()) {
                 return PackageInspectResult.Invalid(R.string.reason_parse)
             }
+            if (destDir != null) {
+                val extractBytes = (apkEntries + obbEntries).sumOf { it.second.size }
+                if (!hasRoomToExtract(freeSpaceOf(destDir), extractBytes)) {
+                    return PackageInspectResult.Invalid(R.string.reason_too_complex)
+                }
+            }
 
             val manifestJson = manifestEntry?.let { entry ->
                 zip.getInputStream(entry).use { readBoundedText(it, MaxMetadataBytes) }
@@ -194,7 +254,7 @@ fun inspectAndExtractPackage(archiveFile: File, destDir: File? = null): PackageI
                     val out = resolveSafeZipEntry(destDir, normalizedPath)
                     out.parentFile?.mkdirs()
                     val written = zip.getInputStream(entry).use { input ->
-                        out.outputStream().use { output -> input.copyTo(output, CopyBufferBytes) }
+                        out.outputStream().use { output -> copyBounded(input, output, entry.size) }
                     }
                     apks += ExtractedFile(entryPath = normalizedPath, name = fileName, size = written, file = out)
                 } else {
@@ -215,7 +275,7 @@ fun inspectAndExtractPackage(archiveFile: File, destDir: File? = null): PackageI
                     val out = resolveSafeZipEntry(destDir, normalizedPath)
                     out.parentFile?.mkdirs()
                     val written = zip.getInputStream(entry).use { input ->
-                        out.outputStream().use { output -> input.copyTo(output, CopyBufferBytes) }
+                        out.outputStream().use { output -> copyBounded(input, output, entry.size) }
                     }
                     obbs += ExtractedFile(
                         entryPath = normalizedPath,
@@ -246,6 +306,7 @@ fun inspectAndExtractPackage(archiveFile: File, destDir: File? = null): PackageI
                 obb.copy(
                     name = mappedName ?: obb.name,
                     obbPackageName = obb.obbPackageName ?: mappedPkg ?: pkg,
+                    otherPackageClaims = listOfNotNull(mappedPkg),
                 )
             }
 
@@ -604,9 +665,15 @@ fun filterSplits(
 
 // ---- Multi-APK ADB Session & OBB Commands ----
 
+/** pm-style failure code of an OBB that names another app; [pmFailure] maps it to a plain sentence. */
+const val ObbOtherAppCode = "INSTALL_GOGO_OBB_PACKAGE_MISMATCH"
+
 private val SessionIdRegex = Regex("""Success:.*\[(\d+)\]""")
 private val UnsafeSplitCharRegex = Regex("[^A-Za-z0-9._-]")
 private val UnsafePackageCharRegex = Regex("[^A-Za-z0-9._]")
+
+const val DisableAdbVerifyCommand = "settings put global verifier_verify_adb_installs 0"
+const val DisableVerifierCommand = "settings put global package_verifier_user_consent -1"
 
 fun createSessionCommand(bypass: Boolean = true, userInstall: Boolean = false): String =
     "pm install-create -r -d${if (bypass) " --bypass-low-target-sdk-block" else ""}" +
@@ -649,6 +716,9 @@ fun obbWriteCommand(packageName: String, obbName: String, size: Long): String =
 /**
  * Installs a multi-APK bundle (and optional `.obb` expansion files) via an ADB package installer session.
  * Aggregates byte progress smoothly across all selected splits and OBB files via [onProgress].
+ * The OBB files always belong to [packageName] (the package of the base APK): an OBB that names another app fails the
+ * install before anything is written, and OBB files are written only after `pm install-commit` succeeded. If that
+ * write fails, the result is still a success with [PmResult.obbFailure] set.
  * If any step after session creation and before commit fails or throws, abandons the session in `finally`.
  */
 fun installBundleSession(
@@ -660,11 +730,20 @@ fun installBundleSession(
     onLog: (String) -> Unit = {},
     userInstall: Boolean = false,
 ): PmResult {
+    val obbPackage = packageName?.takeIf { it.isNotBlank() }
+    if (obbs.isNotEmpty() && (obbPackage == null || obbs.any { !obbBelongsTo(it, obbPackage) })) {
+        onLog("> obb: refused, an OBB file belongs to another app (nothing was written)")
+        return PmResult(false, "Failure [$ObbOtherAppCode]")
+    }
     val totalBytes = splits.sumOf { it.size.coerceAtLeast(0L) } + obbs.sumOf { it.size.coerceAtLeast(0L) }
     onProgress(0L, totalBytes)
 
+    // Keep Google Play Protect out of ADB installs: the package verifier skips them when this setting is 0.
+    onLog("> adb: $DisableAdbVerifyCommand")
+    adb.shell(DisableAdbVerifyCommand)
+    adb.shell(DisableVerifierCommand)
     val createCmd = createSessionCommand(bypass = true, userInstall = userInstall)
-    onLog("> adb: $createCmd (0 permissions granted)")
+    onLog("> adb: $createCmd (none granted by GoGo)")
     var createOut = adb.shell(createCmd)
     if (shouldRetryWithoutBypass(createOut)) {
         val fallbackCmd = createSessionCommand(bypass = false, userInstall = userInstall)
@@ -697,17 +776,21 @@ fun installBundleSession(
             onProgress(completedBytes, totalBytes)
         }
 
-        if (obbs.isNotEmpty()) {
-            val defaultPkg = packageName?.takeIf { it.isNotBlank() }
-                ?: obbs.firstNotNullOfOrNull { it.obbPackageName }
-                ?: return PmResult(false, "Failure [INSTALL_PARSE_FAILED_MANIFEST_MALFORMED: Missing package name for OBB]")
-            val createdDirs = mutableSetOf<String>()
+        committed = true
+        val commitCmd = installCommitCommand(sessionId)
+        onLog("> adb: $commitCmd")
+        val commit = parsePmOutput(adb.shell(commitCmd))
+        if (!commit.success || obbs.isEmpty() || obbPackage == null) return commit
+
+        // The app is installed now; only now may its data files be written.
+        fun obbFailed(why: String): PmResult {
+            onLog("> obb: write failed ($why), the app is installed but its data files were not copied")
+            return PmResult(true, commit.line, obbFailure = why)
+        }
+        try {
+            adb.shell(obbMkdirCommand(obbPackage))
             for (obb in obbs) {
-                val targetPkg = sanitizePackageName(obb.obbPackageName ?: defaultPkg)
-                if (createdDirs.add(targetPkg)) {
-                    adb.shell(obbMkdirCommand(targetPkg))
-                }
-                val cmd = obbWriteCommand(targetPkg, obb.name, obb.size)
+                val cmd = obbWriteCommand(obbPackage, obb.name, obb.size)
                 onLog("> adb: streaming OBB ${obb.name} (${obb.size} B)")
                 val obbOut = obb.openStream().use { stream ->
                     adb.writeStream(cmd, obb.size, stream) { sent ->
@@ -715,18 +798,15 @@ fun installBundleSession(
                     }
                 }
                 if (obbOut.isNotBlank() && !parsePmOutput(obbOut).success) {
-                    return PmResult(false, obbOut.lineSequence().firstOrNull { it.isNotBlank() } ?: "Failure [OBB_WRITE_FAILED]")
+                    return obbFailed(obbOut.lineSequence().firstOrNull { it.isNotBlank() } ?: "Failure [OBB_WRITE_FAILED]")
                 }
                 completedBytes += obb.size
                 onProgress(completedBytes, totalBytes)
             }
+        } catch (e: IOException) {
+            return obbFailed(e.message ?: "I/O error")
         }
-
-        committed = true
-        val commitCmd = installCommitCommand(sessionId)
-        onLog("> adb: $commitCmd")
-        val commitOut = adb.shell(commitCmd)
-        return parsePmOutput(commitOut)
+        return commit
     } finally {
         if (!committed) {
             runCatching { adb.shell(installAbandonCommand(sessionId)) }

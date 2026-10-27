@@ -3,6 +3,7 @@ package app.gogogadget
 import android.content.Context
 import io.github.muntashirakon.adb.AbsAdbConnectionManager
 import io.github.muntashirakon.adb.AdbStream
+import java.io.File
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
@@ -38,6 +39,11 @@ interface AdbClient {
      */
     fun writeStream(command: String, size: Long, input: InputStream, onProgress: (Long) -> Unit = {}): String =
         install(command, size, input, onProgress)
+
+    /**
+     * Pulls a remote file from the target device to [destFile]. Returns true if successfully saved.
+     */
+    fun pull(remotePath: String, destFile: File): Boolean = false
 
     fun disconnect()
 }
@@ -121,6 +127,32 @@ class LibAdbClient(context: Context) : AdbClient {
             if (throttle.shouldReport(System.nanoTime() / 1_000_000L, sent, size)) onProgress(sent)
         }
         out.flush()
+    }
+
+    override fun pull(remotePath: String, destFile: File): Boolean {
+        destFile.parentFile?.mkdirs()
+        val local = java.io.File(remotePath)
+        if (local.exists() && local.canRead()) {
+            return try {
+                local.copyTo(destFile, overwrite = true)
+                destFile.exists() && destFile.length() > 0L
+            } catch (_: Throwable) {
+                false
+            }
+        }
+        return try {
+            val safePath = remotePath.replace("'", "'\\''")
+            manager.openStream("exec:cat '$safePath'").use { stream ->
+                stream.guarded(ShellTimeoutMs) {
+                    destFile.outputStream().use { output ->
+                        stream.openInputStream().copyTo(output, 64 * 1024)
+                    }
+                }
+            }
+            destFile.exists() && destFile.length() > 0L
+        } catch (_: Throwable) {
+            false
+        }
     }
 
     override fun disconnect() {
