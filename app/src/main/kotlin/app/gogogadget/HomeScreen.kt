@@ -1478,6 +1478,28 @@ private fun ConnectionPanel(
                             modifier = Modifier.padding(bottom = 2.dp),
                         )
                     }
+                    if (connection.device?.local != false || it == AdbError.WirelessDebuggingOff) {
+                        Spacer(Modifier.height(8.dp))
+                        OutlinedButton(
+                            onClick = {
+                                onRepost()
+                                onOpenDeveloperOptions()
+                            },
+                            modifier = Modifier.fillMaxWidth().height(44.dp),
+                            shape = RectangleShape,
+                            border = BorderStroke(1.dp, Color(palette.accent)),
+                            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 0.dp),
+                        ) {
+                            Text(
+                                stringResource(R.string.open_wireless_debugging),
+                                style = MaterialTheme.typography.labelLarge,
+                                color = Color(palette.accent),
+                                maxLines = 1,
+                                textAlign = TextAlign.Center,
+                            )
+                        }
+                        Spacer(Modifier.height(4.dp))
+                    }
                 }
                 when (state) {
                     ConnectionState.Pairing -> PairingForm(
