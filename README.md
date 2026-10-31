@@ -17,7 +17,7 @@
 
 **GoGo Gadget** is a modern, standalone, zero-trust package manager and APK installer for Android. It operates independently on your device through Android's native **Wireless Debugging (ADB)** — eliminating the need for a PC, root privileges, or proprietary helper services.
 
-Whether installing split packages (`.apks`, `.xapk`, `.apkm`), deploying to remote Android TVs across your local network, or reverting failed updates with 1-tap backups, GoGo Gadget delivers an uncompromising, privacy-respecting workflow with zero Google dependencies.
+Whether installing split packages (`.apks`, `.xapk`, `.apkm`), deploying to other Android devices across your local network, or reverting failed updates with 1-tap backups, GoGo Gadget delivers an uncompromising, privacy-respecting workflow with zero Google dependencies.
 
 ---
 
@@ -33,14 +33,14 @@ Most Android installers fall into one of two traps: they either depend on Google
 | **Pre-Install Bytecode Security** | None (Basic signature) | None (Blind pass-through) | **Full DEX Bytecode Inspection** |
 | **Automatic Rollback / Backup** | None (Overwrites blindly)| None | **1-Tap Instant Downgrade** |
 | **Splits & Formats (.xapk, .apkm)**| Fails / Incompatible | Manual handling | **Native Seamless Ingestion** |
-| **Remote TV / Local Network Push**| No | No | **Built-in mDNS Network Deploy** |
+| **Remote Network Deploy (Local Wi-Fi)**| No | No | **Built-in mDNS Network Deploy** |
 | **Google Play / Tracking Libs** | Yes | Optional | **Zero Google Code (100% FOSS)** |
 
 ### The Core Strengths
 1. **True Autonomy (No PC & No Running Daemons)**: Connects directly to Android's local pairing service inside the phone. When you close GoGo Gadget, no background daemon stays eating your battery or monitoring your device.
 2. **Built-in Bytecode Antivirus (Pre-Install)**: Before letting an APK touch your system, GoGo Gadget scans the actual DEX headers across `classes.dex`, instantly detecting abusive permissions, obfuscated dynamic class loaders, and hidden binary droppers.
 3. **Fail-Safe 1-Tap Rollback**: Upgraded an app and the new version crashes or has annoying changes? GoGo Gadget automatically archives your previous working version so you can revert with one tap.
-4. **Remote Device Hub**: Install an app on your phone, and push it directly over Wi-Fi to your Android TV or secondary tablet without installing extra apps on the target device.
+4. **Local & Remote Android Deployment**: Install applications directly on your own smartphone via local ADB, or deploy them over Wi-Fi to any other Android phone, tablet, or device on your local network.
 
 ## The Real Problems GoGo Gadget Solves
 
@@ -62,9 +62,9 @@ Sideloading on modern Android is fraught with friction, security risks, and brok
   * *The Pain*: An app update introduces game-breaking bugs, intrusive ads, or breaks compatibility, and Android doesn't allow downgrading without wiping all your application data.
   * *The Solution*: GoGo Gadget automatically archives the current working version before updating. If anything goes wrong, restore the previous APK with one tap.
 
-* **The "Clunky Android TV Sideloading" Problem**
-  * *The Pain*: Getting an APK onto a Smart TV or TV Box usually requires flash drives, cloud drives, file transfer tools, or typing long URLs with a remote control.
-  * *The Solution*: Select the target TV discovered automatically on your local Wi-Fi and push the app straight from your phone.
+* **The "Cross-Device Sideloading" Problem**
+  * *The Pain*: Transferring and installing APKs onto a secondary Android device or family member's phone usually involves messaging apps, cloud drives, file transfer utilities, or USB sticks.
+  * *The Solution*: Select any target Android device discovered automatically over local Wi-Fi and deploy the package directly from your smartphone.
 
 ---
 
@@ -117,7 +117,7 @@ Sideloading on modern Android is fraught with friction, security risks, and brok
 
 - **Zero-Trust Security**: Requests only essential permissions (`INTERNET`, `CHANGE_WIFI_MULTICAST_STATE`, `FOREGROUND_SERVICE`, `POST_NOTIFICATIONS`). Sandboxed isolation ensures your personal storage is never probed.
 - **Split Package Native Engine**: Full parsing and installation for `.apk`, `.xapk`, `.apkm`, `.apks`, and compressed splits.
-- **Target Flexibility**: Install locally on your handheld smartphone or push packages remotely to Android TVs and other network devices via mDNS.
+- **Target Flexibility**: Install locally on your smartphone or deploy packages remotely to any other Android device across your local network via mDNS.
 - **1-Tap Rollback**: Automated previous-version archives safeguard against faulty app updates.
 - **Industrial Clean Flat UI**: Precision high-contrast UI designed for rapid workflow and clarity.
 - **100% Google-Independent**: No Google Play Services or Play Protect requirements.
