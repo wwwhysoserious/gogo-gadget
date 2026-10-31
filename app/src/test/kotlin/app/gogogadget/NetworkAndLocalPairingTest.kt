@@ -99,10 +99,10 @@ class NetworkAndLocalPairingTest {
 
     // ---- network ports and names ----
 
-    @Test fun networkPortIsExplicitThenMdnsThenFiveFiveFiveFive() {
-        assertEquals(37000, networkConnectPort(37000, 42000))
-        assertEquals(42000, networkConnectPort(0, 42000))
-        assertEquals(5555, networkConnectPort(0, null))
+    @Test fun networkPortCandidatesAreMdnsThenLastGoodThenFiveFiveFiveFive() {
+        assertEquals(listOf(42000, 37000, 5555), connectPortCandidates(42000, 37000))
+        assertEquals(listOf(42000, 5555), connectPortCandidates(42000, null))
+        assertEquals(listOf(5555), connectPortCandidates(null, null))
         assertEquals(5555, ClassicAdbPort)
     }
 

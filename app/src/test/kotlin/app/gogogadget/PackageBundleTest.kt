@@ -49,6 +49,24 @@ class PackageBundleTest {
         assertTrue(bundle.obbs.isEmpty())
     }
 
+    @Test fun anApkThatCarriesAnotherApkIsStillOneApp() {
+        // Audit F23: installers and tools ship a helper APK in assets; that used to make the whole file "not an app".
+        val zip = makeZip(
+            "AndroidManifest.xml" to ByteArray(64) { 1 },
+            "classes.dex" to ByteArray(128) { 2 },
+            "assets/stub.apk" to ByteArray(300) { 7 },
+        )
+        val res = inspectBytes(zip)
+        assertTrue(res is PackageInspectResult.Valid)
+        val bundle = (res as PackageInspectResult.Valid).bundle
+        assertEquals(PackageFormat.SingleApk, bundle.format)
+        assertTrue(bundle.apks.isEmpty())
+        // Without a root manifest, a lone nested .apk is still a bundle.
+        val split = inspectBytes(makeZip("base.apk" to ByteArray(300) { 7 }))
+        assertTrue(split is PackageInspectResult.Valid)
+        assertTrue((split as PackageInspectResult.Valid).bundle.format != PackageFormat.SingleApk)
+    }
+
     @Test fun handlesStoredZipEntryWithDataDescriptorAndSingleApkWithoutExtracting() {
         val arscBytes = ByteArray(128) { 0x42 }
         val manifestBytes = ByteArray(64) { 0x11 }
@@ -411,6 +429,10 @@ class PackageBundleTest {
             onShell = { cmd ->
                 when {
                     cmd == DisableAdbVerifyCommand || cmd == DisableVerifierCommand -> ""
+                    cmd == ReadAdbVerifyCommand -> "1"
+                    cmd == ReadVerifierCommand -> "null"
+                    cmd == "settings put global verifier_verify_adb_installs 1" ||
+                        cmd == "settings delete global package_verifier_user_consent" -> ""
                     cmd == "pm install-create -r -d --bypass-low-target-sdk-block" ->
                         "Error: Unknown option: --bypass-low-target-sdk-block"
                     cmd == "pm install-create -r -d" ->
@@ -452,12 +474,17 @@ class PackageBundleTest {
         assertTrue(result.success)
         assertEquals(
             listOf(
+                // Changed in 0.9.50 (audit F26): the Play Protect settings are read first and put back at the end.
+                ReadAdbVerifyCommand,
+                ReadVerifierCommand,
                 DisableAdbVerifyCommand,
                 DisableVerifierCommand,
                 "pm install-create -r -d --bypass-low-target-sdk-block",
                 "pm install-create -r -d",
                 "pm install-commit 778899",
                 "mkdir -p '/sdcard/Android/obb/com.example.game'",
+                "settings put global verifier_verify_adb_installs 1",
+                "settings delete global package_verifier_user_consent",
             ),
             adb.shellCommands,
         )

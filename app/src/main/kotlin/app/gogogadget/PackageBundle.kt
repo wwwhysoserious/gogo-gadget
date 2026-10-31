@@ -211,7 +211,8 @@ fun inspectAndExtractPackage(archiveFile: File, destDir: File? = null): PackageI
 
             if (entryCount == 0) return PackageInspectResult.Invalid(R.string.reason_parse)
 
-            if (hasRootAndroidManifest && apkEntries.isEmpty()) {
+            // A manifest at the root makes it ONE app; an .apk inside it (assets/stub.apk) is data, which the deep scan reads.
+            if (hasRootAndroidManifest) {
                 return PackageInspectResult.Valid(
                     ExtractedBundle(
                         format = PackageFormat.SingleApk,
@@ -223,7 +224,7 @@ fun inspectAndExtractPackage(archiveFile: File, destDir: File? = null): PackageI
                 )
             }
 
-            if (hasRootAndroidManifest || apkEntries.isEmpty()) {
+            if (apkEntries.isEmpty()) {
                 return PackageInspectResult.Invalid(R.string.reason_parse)
             }
             if (destDir != null) {
@@ -674,9 +675,52 @@ private val UnsafePackageCharRegex = Regex("[^A-Za-z0-9._]")
 
 const val DisableAdbVerifyCommand = "settings put global verifier_verify_adb_installs 0"
 const val DisableVerifierCommand = "settings put global package_verifier_user_consent -1"
+const val ReadAdbVerifyCommand = "settings get global verifier_verify_adb_installs"
+const val ReadVerifierCommand = "settings get global package_verifier_user_consent"
+private const val AdbVerifyKey = "verifier_verify_adb_installs"
+private const val VerifierConsentKey = "package_verifier_user_consent"
+private val WholeNumberRegex = Regex("^-?[0-9]{1,10}$")
 
-fun createSessionCommand(bypass: Boolean = true, userInstall: Boolean = false): String =
-    "pm install-create -r -d${if (bypass) " --bypass-low-target-sdk-block" else ""}" +
+/**
+ * What a global setting held before the install turned it off. [known] is false when the device's answer was not understood:
+ * such a setting is left as the install set it rather than guessed. A [value] of null with [known] true means "not set".
+ */
+data class SavedSetting(val key: String, val value: String?, val known: Boolean)
+
+/** Reads the answer of `settings get global <key>`: `null` is "not set", a whole number is its value, anything else is unknown. */
+fun parseSavedSetting(key: String, output: String): SavedSetting {
+    val text = output.trim()
+    return when {
+        text.equals("null", ignoreCase = true) -> SavedSetting(key, null, true)
+        WholeNumberRegex.matches(text) -> SavedSetting(key, text, true)
+        else -> SavedSetting(key, null, false)
+    }
+}
+
+/** The command that puts [saved] back, or null when its previous value is not known. */
+fun restoreSettingCommand(saved: SavedSetting): String? = when {
+    !saved.known -> null
+    saved.value == null -> "settings delete global ${saved.key}"
+    else -> "settings put global ${saved.key} ${saved.value}"
+}
+
+/** The two Play Protect settings as they are now, read before the install changes them. Never throws. */
+fun readVerifierSettings(adb: AdbClient): List<SavedSetting> = listOf(
+    parseSavedSetting(AdbVerifyKey, runCatching { adb.shell(ReadAdbVerifyCommand) }.getOrDefault("")),
+    parseSavedSetting(VerifierConsentKey, runCatching { adb.shell(ReadVerifierCommand) }.getOrDefault("")),
+)
+
+/** Puts the settings of [saved] back as they were. Best effort: a lost connection must not turn a finished install into an error. */
+fun restoreVerifierSettings(adb: AdbClient, saved: List<SavedSetting>, onLog: (String) -> Unit = {}) {
+    for (setting in saved) {
+        val command = restoreSettingCommand(setting) ?: continue
+        onLog("> adb: $command (Play Protect setting put back as it was)")
+        runCatching { adb.shell(command) }
+    }
+}
+
+fun createSessionCommand(bypass: Boolean = true, userInstall: Boolean = false, testOnly: Boolean = false): String =
+    "pm install-create -r -d${if (testOnly) " -t" else ""}${if (bypass) " --bypass-low-target-sdk-block" else ""}" +
         if (userInstall) " --install-reason $InstallReasonUser" else ""
 
 fun parseSessionId(output: String): Long? =
@@ -729,12 +773,32 @@ fun installBundleSession(
     onProgress: (sent: Long, total: Long) -> Unit = { _, _ -> },
     onLog: (String) -> Unit = {},
     userInstall: Boolean = false,
+    testOnly: Boolean = false,
 ): PmResult {
     val obbPackage = packageName?.takeIf { it.isNotBlank() }
     if (obbs.isNotEmpty() && (obbPackage == null || obbs.any { !obbBelongsTo(it, obbPackage) })) {
         onLog("> obb: refused, an OBB file belongs to another app (nothing was written)")
         return PmResult(false, "Failure [$ObbOtherAppCode]")
     }
+    // The install turns Play Protect's ADB check off; whatever the outcome, the previous settings are put back.
+    val saved = readVerifierSettings(adb)
+    try {
+        return runBundleSession(adb, splits, obbs, obbPackage, onProgress, onLog, userInstall, testOnly)
+    } finally {
+        restoreVerifierSettings(adb, saved, onLog)
+    }
+}
+
+private fun runBundleSession(
+    adb: AdbClient,
+    splits: List<ExtractedFile>,
+    obbs: List<ExtractedFile>,
+    obbPackage: String?,
+    onProgress: (sent: Long, total: Long) -> Unit,
+    onLog: (String) -> Unit,
+    userInstall: Boolean,
+    testOnly: Boolean,
+): PmResult {
     val totalBytes = splits.sumOf { it.size.coerceAtLeast(0L) } + obbs.sumOf { it.size.coerceAtLeast(0L) }
     onProgress(0L, totalBytes)
 
@@ -742,11 +806,11 @@ fun installBundleSession(
     onLog("> adb: $DisableAdbVerifyCommand")
     adb.shell(DisableAdbVerifyCommand)
     adb.shell(DisableVerifierCommand)
-    val createCmd = createSessionCommand(bypass = true, userInstall = userInstall)
+    val createCmd = createSessionCommand(bypass = true, userInstall = userInstall, testOnly = testOnly)
     onLog("> adb: $createCmd (none granted by GoGo)")
     var createOut = adb.shell(createCmd)
     if (shouldRetryWithoutBypass(createOut)) {
-        val fallbackCmd = createSessionCommand(bypass = false, userInstall = userInstall)
+        val fallbackCmd = createSessionCommand(bypass = false, userInstall = userInstall, testOnly = testOnly)
         onLog("> adb: retrying $fallbackCmd")
         createOut = adb.shell(fallbackCmd)
     }

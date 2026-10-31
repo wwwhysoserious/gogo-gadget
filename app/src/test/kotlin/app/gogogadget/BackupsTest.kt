@@ -116,7 +116,7 @@ class BackupsTest {
                 appName = "Test App",
                 versionName = "1.0",
             )
-            val item1 = backupManager.createBackup(adb, "com.test.pkg", installedV10)
+            val item1 = backupManager.createBackup(adb, "com.test.pkg", installedV10, "tv", "TV")
             assertNotNull(item1)
             assertEquals(10L, item1?.versionCode)
             assertEquals("Test App", item1?.appName)
@@ -133,7 +133,7 @@ class BackupsTest {
                 appName = "Test App",
                 versionName = "1.1",
             )
-            val item2 = backupManager.createBackup(adb, "com.test.pkg", installedV11)
+            val item2 = backupManager.createBackup(adb, "com.test.pkg", installedV11, "tv", "TV")
             assertNotNull(item2)
             assertEquals(11L, item2?.versionCode)
 
@@ -143,11 +143,11 @@ class BackupsTest {
             assertEquals("1.1", list2[0].versionName)
 
             // Step 3: Deletion frees storage
-            val deleted = backupManager.deleteBackup("com.test.pkg")
+            val deleted = backupManager.deleteBackup("tv", "com.test.pkg")
             assertTrue(deleted)
             val list3 = backupManager.listBackups()
             assertTrue("Backups list should be empty after deletion", list3.isEmpty())
-            assertFalse(File(tempDir, "com.test.pkg").exists())
+            assertFalse(File(tempDir, "tv/com.test.pkg").exists())
         } finally {
             tempDir.deleteRecursively()
         }

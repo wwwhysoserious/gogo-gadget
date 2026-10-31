@@ -8,7 +8,7 @@ import java.io.File
 
 /**
  * Phase 5: Auto-backup & 1-tap Reversion metadata.
- * Persisted in `context.filesDir/backups/<packageName>/backup_meta.json`.
+ * Persisted in `context.filesDir/backups/<deviceId>/<packageName>/backup_meta.json`.
  */
 data class BackupMetadata(
     val packageName: String,
@@ -17,6 +17,10 @@ data class BackupMetadata(
     val versionName: String?,
     val timestamp: Long,
     val apkFileNames: List<String>,
+    val deviceId: String = UNASSIGNED_DEVICE,
+    val deviceName: String? = null,
+    /** SHA-256 of every saved APK by file name, taken when the backup was made; empty for backups of older versions. */
+    val apkSha256: Map<String, String> = emptyMap(),
 )
 
 /** Represents a saved application backup on disk ready for listing and 1-tap reversion. */
@@ -28,7 +32,13 @@ data class AppBackupItem(
     val timestamp: Long,
     val totalSizeBytes: Long,
     val apkFiles: List<File>,
-)
+    val deviceId: String = UNASSIGNED_DEVICE,
+    val deviceName: String? = null,
+    val apkSha256: Map<String, String> = emptyMap(),
+) {
+    /** Unique across devices; the same package can be saved for several of them. */
+    val key: String get() = "$deviceId/$packageName"
+}
 
 class BackupManager(
     private val context: Context? = null,
@@ -36,6 +46,11 @@ class BackupManager(
 ) {
 
     constructor(backupsDir: File) : this(context = null, backupsDir = backupsDir)
+
+    /** Moves backups from before devices into `_unassigned`; call once at startup. */
+    fun migrateLegacy() {
+        runCatching { migrateLegacyBackups(backupsDir) }
+    }
 
     /**
      * Parses `pm path <packageName>` output into a list of absolute APK paths on the target device.
@@ -50,21 +65,23 @@ class BackupManager(
 
     /**
      * Backs up the installed APKs for [packageName] from the target device over [adb].
-     * Overwrites any existing backup for this package (keeps 1 previous version per package).
+     * Overwrites any existing backup for this package on this device (keeps 1 previous version per device and package).
      * Returns the created [AppBackupItem] or null on failure.
      */
     fun createBackup(
         adb: AdbClient,
         packageName: String,
         installedInfo: InstalledAppInfo?,
+        deviceId: String,
+        deviceName: String?,
     ): AppBackupItem? {
         val safePkg = sanitizePackageName(packageName)
         val pmPathOutput = runCatching { adb.shell("pm path $safePkg") }.getOrDefault("")
         val remotePaths = parsePmPathOutput(pmPathOutput)
         if (remotePaths.isEmpty()) return null
 
-        val pkgDir = File(backupsDir, packageName)
-        // Keep only 1 previous version per package (overwrites previous backup)
+        val pkgDir = backupDir(backupsDir, deviceId, packageName)
+        // Keep only 1 previous version per device and package (overwrites previous backup)
         if (pkgDir.exists()) {
             pkgDir.deleteRecursively()
         }
@@ -106,6 +123,7 @@ class BackupManager(
         val resolvedVersionName = installedInfo?.versionName
             ?: archiveInfo?.versionName
 
+        val hashes = savedFiles.associate { it.name to sha256Hex(it) }
         val meta = BackupMetadata(
             packageName = packageName,
             appName = resolvedAppName,
@@ -113,6 +131,9 @@ class BackupManager(
             versionName = resolvedVersionName,
             timestamp = System.currentTimeMillis(),
             apkFileNames = savedFiles.map { it.name },
+            deviceId = deviceId,
+            deviceName = deviceName,
+            apkSha256 = hashes,
         )
 
         saveMetadata(pkgDir, meta)
@@ -126,6 +147,9 @@ class BackupManager(
             timestamp = meta.timestamp,
             totalSizeBytes = totalSize,
             apkFiles = savedFiles,
+            deviceId = deviceId,
+            deviceName = deviceName,
+            apkSha256 = hashes,
         )
     }
 
@@ -152,6 +176,9 @@ class BackupManager(
             if (meta.versionName != null) put("versionName", meta.versionName)
             put("timestamp", meta.timestamp)
             put("apkFileNames", JSONArray(meta.apkFileNames))
+            put("deviceId", meta.deviceId)
+            if (meta.deviceName != null) put("deviceName", meta.deviceName)
+            put("apkSha256", JSONObject().also { o -> meta.apkSha256.forEach { (name, sha) -> o.put(name, sha) } })
         }
         File(pkgDir, "backup_meta.json").writeText(json.toString(2), Charsets.UTF_8)
     }
@@ -175,6 +202,11 @@ class BackupManager(
                 versionName = json.optString("versionName").takeIf { it.isNotBlank() },
                 timestamp = json.optLong("timestamp", file.lastModified()),
                 apkFileNames = apkNames,
+                deviceId = json.optString("deviceId").takeIf { it.isNotBlank() } ?: UNASSIGNED_DEVICE,
+                deviceName = json.optString("deviceName").takeIf { it.isNotBlank() },
+                apkSha256 = json.optJSONObject("apkSha256")?.let { o ->
+                    o.keys().asSequence().associateWith { o.optString(it) }.filterValues { it.length == 64 }
+                }.orEmpty(),
             )
         } catch (_: Throwable) {
             null
@@ -183,33 +215,65 @@ class BackupManager(
 
     fun listBackups(): List<AppBackupItem> {
         if (!backupsDir.exists() || !backupsDir.isDirectory) return emptyList()
-        val pkgDirs = backupsDir.listFiles { f -> f.isDirectory } ?: return emptyList()
+        val deviceDirs = backupsDir.listFiles { f -> f.isDirectory } ?: return emptyList()
         val items = mutableListOf<AppBackupItem>()
-        for (dir in pkgDirs) {
-            val meta = readMetadata(dir)
-            val files = if (meta != null && meta.apkFileNames.isNotEmpty()) {
-                meta.apkFileNames.map { File(dir, it) }.filter { it.exists() && it.length() > 0L }
-            } else {
-                dir.listFiles { f -> f.isFile && f.name.endsWith(".apk") }?.toList().orEmpty()
-            }
-            if (files.isNotEmpty()) {
-                val totalSize = files.sumOf { it.length() }
-                items += AppBackupItem(
-                    packageName = meta?.packageName ?: dir.name,
-                    appName = meta?.appName ?: dir.name,
-                    versionCode = meta?.versionCode ?: 0L,
-                    versionName = meta?.versionName,
-                    timestamp = meta?.timestamp ?: dir.lastModified(),
-                    totalSizeBytes = totalSize,
-                    apkFiles = files,
-                )
+        for (deviceDir in deviceDirs) {
+            val pkgDirs = deviceDir.listFiles { f -> f.isDirectory } ?: continue
+            for (dir in pkgDirs) {
+                val meta = readMetadata(dir)
+                val files = if (meta != null && meta.apkFileNames.isNotEmpty()) {
+                    meta.apkFileNames.map { File(dir, it) }.filter { it.exists() && it.length() > 0L }
+                } else {
+                    dir.listFiles { f -> f.isFile && f.name.endsWith(".apk") }?.toList().orEmpty()
+                }
+                if (files.isNotEmpty()) {
+                    val totalSize = files.sumOf { it.length() }
+                    items += AppBackupItem(
+                        packageName = meta?.packageName ?: dir.name,
+                        appName = meta?.appName ?: dir.name,
+                        versionCode = meta?.versionCode ?: 0L,
+                        versionName = meta?.versionName,
+                        timestamp = meta?.timestamp ?: dir.lastModified(),
+                        totalSizeBytes = totalSize,
+                        apkFiles = files,
+                        // The folder decides the device; the file only names it.
+                        deviceId = deviceDir.name,
+                        deviceName = meta?.deviceName,
+                        apkSha256 = meta?.apkSha256.orEmpty(),
+                    )
+                }
             }
         }
         return items.sortedByDescending { it.timestamp }
     }
 
-    fun deleteBackup(packageName: String): Boolean {
-        val dir = File(backupsDir, packageName)
+    fun deleteBackup(deviceId: String, packageName: String): Boolean {
+        val dir = backupDir(backupsDir, deviceId, packageName)
         return if (dir.exists()) dir.deleteRecursively() else false
     }
+}
+
+/** The result of comparing a saved backup with the hashes taken when it was made. */
+sealed interface BackupCheck {
+    data object Verified : BackupCheck
+
+    /** The backup is from a version that did not save hashes: it cannot be compared. */
+    data object NoHash : BackupCheck
+
+    /** These files differ from what was saved, or were not part of the backup. */
+    data class Changed(val files: List<String>) : BackupCheck
+}
+
+/**
+ * True integrity of a backup before it is installed again: every file must have the SHA-256 recorded when it was pulled from
+ * the device. A backup folder that another program changed is refused. (Android still enforces that the signer matches the
+ * installed app.)
+ */
+fun verifyBackupFiles(item: AppBackupItem): BackupCheck {
+    if (item.apkSha256.isEmpty()) return BackupCheck.NoHash
+    val changed = item.apkFiles.filter { file ->
+        val expected = item.apkSha256[file.name]
+        expected == null || !file.isFile || !sha256Hex(file).equals(expected, ignoreCase = true)
+    }
+    return if (changed.isEmpty()) BackupCheck.Verified else BackupCheck.Changed(changed.map { it.name })
 }

@@ -35,7 +35,8 @@ import javax.crypto.spec.GCMParameterSpec
 private const val HashBufferBytes = 64 * 1024
 private const val MaxManifestBytes = 4 * 1024 * 1024
 private const val MaxCertEntryBytes = 512 * 1024
-internal const val MaxVtResponseBytes = 256 * 1024
+/** A VirusTotal file report with every engine's result can be several hundred KiB; a longer body is never parsed. */
+internal const val MaxVtResponseBytes = 2 * 1024 * 1024
 
 /** A file with fewer analysing engines than this is not trusted, even when none of them flags it. */
 const val MinVtEngines = 20
@@ -66,14 +67,32 @@ val KnownTestKeySha256s: Set<String> = setOf(
     "b79df4a82e90b57526525e2a39f21f90f5c41023f6760d92c07a0f964e2b0d84",
 )
 
-private val KnownDebugOrTestDnTokens: List<String> = listOf(
-    "CN=Android Debug",
-    "EmailAddress=android@android.com",
-    "OU=Android",
-    "CN=Android",
-    "O=Android",
-    "CN=Unknown",
-    "CN=Test",
+/**
+ * Certificates whose private key is public AND that mark a build as a system component: an APK signed with one can claim
+ * the platform's privileges (shared UID `android.uid.system`). Match is a hard block. The digests are the AOSP platform,
+ * shared and media keys listed above (the `.x509.pem` files in `build/target/product/security`, public in the AOSP tree). The AOSP
+ * `testkey` is NOT here: modders sign with it all the time, so it stays a Yellow "test key" warning.
+ *
+ * OEM platform certificates that leaked (reported by Google's Android Partner Vulnerability Initiative in 2022:
+ * Samsung, LG, MediaTek, Revoview, Szroco) are NOT embedded: no digest could be cited from a source at hand, and one is
+ * never guessed. See the TODO list in the 0.9.28 section of the planning progress file.
+ */
+val CompromisedPlatformKeySha256s: Set<String> = setOf(
+    // AOSP build/target/product/security/platform.x509.pem
+    "27196e386b875e76adf700e7ea84e4c6eee33dfa8906c22283e97c3114461f2d",
+    // AOSP build/target/product/security/shared.x509.pem
+    "5b368cff2da2686996bc95eac190eaa4f5630f5f2050d07139c47f8c3190339f",
+    // AOSP build/target/product/security/media.x509.pem
+    "b79df4a82e90b57526525e2a39f21f90f5c41023f6760d92c07a0f964e2b0d84",
+)
+
+/**
+ * Subject tokens of the public modding tools (Lucky Patcher, MT Manager, APKTool...): an APK signed by one of them was
+ * repackaged. The Android debug certificate is matched by its complete DN ([isAndroidDebugDn]) and the AOSP keys by their
+ * SHA-256 ([KnownTestKeySha256s]); generic names such as `CN=Unknown`, `CN=Test` or `OU=Android` are NOT here, because
+ * `keytool` writes "Unknown" when a developer presses Enter on every question and real teams use "Android" as a unit name.
+ */
+private val ModToolDnTokens: List<String> = listOf(
     "O=APKTool",
     "CN=APK Easy Tool",
     "CN=MT Manager",
@@ -126,21 +145,41 @@ fun truncateSha256(sha256: String): String {
 
 // ---- Shield warning reasons, offline report, VirusTotal lookup, and verdict ----
 
+/**
+ * Why a package is not Green. The order is the order of gravity: Red reasons first, then Yellow, and the UI lists them
+ * that way ([orderedByGravity]).
+ */
 enum class ShieldWarningReason {
     MalwareDetected,
-    UnsignedPackage,
-    DebugOrTestCertificate,
+    CompromisedKey,
     SignatureMismatch,
-    VersionDowngrade,
-    VirusTotalKeyMissing,
-    NotKnownToVirusTotal,
-    VirusTotalUnreachable,
-    TooFewEngines,
-    TooLargeToVerify,
     PackageMismatch,
-    DropperDetected,
+    MalformedArchive,
+    UnsignedPackage,
+    LegacySignatureOnly,
     AdwareDetected,
     AbusivePermissions,
+    VersionDowngrade,
+
+    /** 1 to 3 engines flag the file and none of them is serious: the user decides. */
+    EnginesFlagged,
+    DropperDetected,
+    DebugOrTestCertificate,
+    SuspiciousNativeCode,
+    InvalidNativeLibrary,
+    RiskyPermissionCombo,
+
+    /** Part of the package could not be inspected, so it is not proven clean. */
+    ScanIncomplete,
+    NotKnownToVirusTotal,
+
+    /** No online source could be reached (no connection, timeout, service error). */
+    VirusTotalUnreachable,
+    OnlineRateLimited,
+    OnlineKeyRejected,
+    TooFewEngines,
+    StaleAnalysis,
+    VirusTotalKeyMissing,
     SelfUpdaterPermission,
 }
 
@@ -150,18 +189,30 @@ enum class SecuritySeverity { Red, Yellow }
 
 /**
  * Categorizes security verdict reasons into 3-Color Security Tiers:
- * - RED (Critical / Hard Block): MalwareDetected, AdwareDetected, SignatureMismatch,
- *   AbusivePermissions, UnsignedPackage, PackageMismatch, VersionDowngrade, VirusTotalUnreachable,
- *   TooFewEngines, TooLargeToVerify. Hard block, no override button. Protected fail-closed.
- * - YELLOW (Caution / Mod Risk / User Decision): DropperDetected, DebugOrTestCertificate,
- *   NotKnownToVirusTotal, VirusTotalKeyMissing. Suspends and presents CautionPrompt.
+ * - YELLOW (Caution / User Decision): everything that is not proof of harm. The user can accept it: EnginesFlagged,
+ *   DropperDetected, DebugOrTestCertificate, SuspiciousNativeCode, InvalidNativeLibrary, RiskyPermissionCombo,
+ *   ScanIncomplete, NotKnownToVirusTotal, VirusTotalUnreachable, OnlineRateLimited, OnlineKeyRejected, TooFewEngines,
+ *   StaleAnalysis, VirusTotalKeyMissing, SelfUpdaterPermission. A missing proof is never Red.
+ * - RED (Critical / Hard Block, no override): proof of harm or of a forged package: MalwareDetected, CompromisedKey,
+ *   SignatureMismatch, PackageMismatch, MalformedArchive, UnsignedPackage, LegacySignatureOnly, AdwareDetected,
+ *   AbusivePermissions, VersionDowngrade.
  */
 fun ShieldWarningReason.severity(): SecuritySeverity = when (this) {
+    ShieldWarningReason.EnginesFlagged,
     ShieldWarningReason.DropperDetected,
     ShieldWarningReason.DebugOrTestCertificate,
+    ShieldWarningReason.SuspiciousNativeCode,
+    ShieldWarningReason.InvalidNativeLibrary,
+    ShieldWarningReason.RiskyPermissionCombo,
+    ShieldWarningReason.ScanIncomplete,
     ShieldWarningReason.NotKnownToVirusTotal,
-    ShieldWarningReason.SelfUpdaterPermission,
-    ShieldWarningReason.VirusTotalKeyMissing -> SecuritySeverity.Yellow
+    ShieldWarningReason.VirusTotalUnreachable,
+    ShieldWarningReason.OnlineRateLimited,
+    ShieldWarningReason.OnlineKeyRejected,
+    ShieldWarningReason.TooFewEngines,
+    ShieldWarningReason.StaleAnalysis,
+    ShieldWarningReason.VirusTotalKeyMissing,
+    ShieldWarningReason.SelfUpdaterPermission -> SecuritySeverity.Yellow
     else -> SecuritySeverity.Red
 }
 
@@ -195,11 +246,31 @@ data class OfflineScanReport(
     val allPermissions: List<String> = emptyList(),
     val certSubject: String? = null,
     val issueDetail: String? = null,
+    /** Known tracker SDKs found by the deep scan (informational only). */
+    val trackers: List<String> = emptyList(),
+    /** SHA-256 of every certificate in the APK's signing-certificate lineage (v3 rotation), oldest first; empty without rotation. */
+    val signerLineageSha256: Set<String> = emptySet(),
+    /** Every deep-scan finding with its code and parameters, so the screen can say it in the user's language. */
+    val issues: List<StaticAnalysisIssue> = emptyList(),
+    /**
+     * Capabilities the app ships but does not request, such as `BIND_ACCESSIBILITY_SERVICE` when it declares an accessibility
+     * service. They take part in the permission rules and are not counted as requested permissions.
+     */
+    val capabilities: Set<String> = emptySet(),
 )
 
 sealed interface VtLookupResult {
-    /** [lastAnalysisDate] is epoch seconds, null when VirusTotal did not say. */
-    data class Found(val malicious: Int, val suspicious: Int, val total: Int, val lastAnalysisDate: Long? = null) : VtLookupResult
+    /**
+     * [lastAnalysisDate] is epoch seconds, null when the service did not say. [detections] are the engines that flagged the
+     * file (category malicious or suspicious) with the name each gave; empty when the service gave only counts.
+     */
+    data class Found(
+        val malicious: Int,
+        val suspicious: Int,
+        val total: Int,
+        val lastAnalysisDate: Long? = null,
+        val detections: List<EngineFlag> = emptyList(),
+    ) : VtLookupResult
     data object UnknownHash : VtLookupResult
     data object InvalidKey : VtLookupResult
     data object RateLimited : VtLookupResult
@@ -211,8 +282,21 @@ enum class ShieldStatusKind { VerifiedWithVt, TrustedUpdate }
 fun shieldStatusKind(verdict: ShieldVerdict.Clean): ShieldStatusKind =
     if (verdict.trustedUpdate) ShieldStatusKind.TrustedUpdate else ShieldStatusKind.VerifiedWithVt
 
-/** What VirusTotal said about one APK of the package (a bundle has one entry per split). */
-data class ShieldFileEvidence(val name: String, val sizeBytes: Long, val sha256: String, val vt: VtLookupResult)
+/**
+ * What the online sources said about one APK of the package (a bundle has one entry per split). [vt] and [md] are null
+ * when that source was not asked (no key); a source that was asked and failed is one of the failure results.
+ */
+data class ShieldFileEvidence(
+    val name: String,
+    val sizeBytes: Long,
+    val sha256: String,
+    val vt: VtLookupResult? = null,
+    /** False for a resource-only split: it is not looked up online (it still went through the offline checks). */
+    val lookedUp: Boolean = true,
+    val md: VtLookupResult? = null,
+    val vtInfo: SourceInfo = SourceInfo(),
+    val mdInfo: SourceInfo = SourceInfo(),
+)
 
 /** A file VirusTotal does not know yet, which the user may choose to upload. */
 data class UploadCandidate(val name: String, val sizeBytes: Long, val sha256: String)
@@ -220,20 +304,26 @@ data class UploadCandidate(val name: String, val sizeBytes: Long, val sha256: St
 sealed interface ShieldVerdict {
     val offline: OfflineScanReport?
 
-    /** No engine flags the package ([vtSummary] like `0/62`, null when a trusted update was not looked up). */
+    /** GoGo's own report of what the online sources said; null when nothing was looked up. */
+    val report: ShieldReport?
+
+    /** No engine flags the package ([vtSummary] like `VirusTotal 0/62`, null when a trusted update was not looked up). */
     data class Clean(
         val sha256: String,
         val vtSummary: String?,
         override val offline: OfflineScanReport? = null,
         val trustedUpdate: Boolean = false,
+        override val report: ShieldReport? = null,
     ) : ShieldVerdict
 
+    /** [vtMalicious] and [vtTotal] are the flagging engines and the engines asked, for the worst file. */
     data class Warning(
         val sha256: String,
         val reasons: List<ShieldWarningReason>,
         val vtMalicious: Int,
         val vtTotal: Int,
         override val offline: OfflineScanReport? = null,
+        override val report: ShieldReport? = null,
     ) : ShieldVerdict
 
     /** Safety is not proven yet: these files can be sent to VirusTotal, after the user agrees. */
@@ -241,31 +331,74 @@ sealed interface ShieldVerdict {
         val sha256: String,
         val files: List<UploadCandidate>,
         override val offline: OfflineScanReport? = null,
+        override val report: ShieldReport? = null,
     ) : ShieldVerdict
 }
 
 /**
  * An update of the installed app: it is signed with the same certificate as the installed one, its version is not
- * older, and the offline scan found nothing wrong.
+ * older, and the offline scan found nothing wrong. A lone self-updater permission is information, not a finding.
  */
 fun isTrustedUpdate(offline: OfflineScanReport, installed: InstalledAppInfo?): Boolean {
     val installedSig = installed?.sigSha256?.normalizeHexSha256() ?: return false
     val installedVersion = installed.versionCode ?: return false
     val candidateSig = offline.signerSha256?.normalizeHexSha256() ?: return false
     val candidateVersion = offline.versionCode ?: return false
-    return offline.reasons.isEmpty() && candidateSig == installedSig && candidateVersion >= installedVersion
+    // A key rotation counts: the installed certificate is an ancestor of the new signer in the APK's lineage.
+    val sameSigner = candidateSig == installedSig || installedSig in offline.signerLineageSha256
+    return offline.reasons.all { it == ShieldWarningReason.SelfUpdaterPermission } && sameSigner && candidateVersion >= installedVersion
 }
 
-private fun vtSummaryOf(found: List<VtLookupResult.Found>): String? {
-    val fewest = found.minByOrNull { it.total } ?: return null
-    val base = "${fewest.malicious + fewest.suspicious}/${fewest.total}"
-    return if (found.size > 1) "$base, ${found.size} files" else base
+/** True when the newest dated analysis of [answered] is older than [StaleAnalysisDays]; undated sources never make it fresh. */
+internal fun isStaleAnalysis(answered: List<SourceReport>, nowEpochSeconds: Long): Boolean {
+    val dated = answered.mapNotNull { it.analysisDate }
+    if (dated.isEmpty()) return false
+    return dated.all { (nowEpochSeconds - it) / 86_400L > StaleAnalysisDays }
+}
+
+/** What is missing from the online proof of each looked-up file; fills [reasons] and the files nobody knows into [unknown]. */
+private fun collectOnlineGaps(
+    checked: List<ReportFile>,
+    nowEpochSeconds: Long,
+    reasons: MutableSet<ShieldWarningReason>,
+    unknown: MutableList<ReportFile>,
+) {
+    if (checked.isEmpty()) {
+        reasons += ShieldWarningReason.VirusTotalUnreachable
+        return
+    }
+    for (file in checked) {
+        val queried = file.sources.filter { it.status != SourceStatus.NotQueried }
+        val answered = queried.filter { it.status == SourceStatus.Answered }
+        when {
+            answered.isNotEmpty() -> {
+                if (answered.maxOf { it.total } < MinVtEngines) reasons += ShieldWarningReason.TooFewEngines
+                if (isStaleAnalysis(answered, nowEpochSeconds)) reasons += ShieldWarningReason.StaleAnalysis
+            }
+            queried.isEmpty() -> reasons += ShieldWarningReason.VirusTotalUnreachable
+            queried.all { it.status == SourceStatus.UnknownHash } -> unknown += file
+            else -> {
+                // One source did not know the file and another failed: the file is not "unknown", it is not checked.
+                if (queried.any { it.status == SourceStatus.RateLimited }) reasons += ShieldWarningReason.OnlineRateLimited
+                if (queried.any { it.status == SourceStatus.InvalidKey }) reasons += ShieldWarningReason.OnlineKeyRejected
+                if (queried.any { it.status == SourceStatus.Unavailable }) reasons += ShieldWarningReason.VirusTotalUnreachable
+            }
+        }
+    }
 }
 
 /**
- * Decides whether the package is proven clean; anything that is not proven is blocked. Rules, first match wins:
- * offline problems, a flagged file, a trusted update, no key, VirusTotal unreachable, too few engines, an unknown
- * file (too large, or [ShieldVerdict.NeedsUpload]), and finally every file known and clean.
+ * Decides what the package is, from BOTH the on-device findings and the online evidence; the result is the worst of the
+ * two, so an on-device warning never hides what the online engines said. Rules:
+ * - engines: 4 or more distinct flagging engines, or any serious detection name, is Red ([ShieldWarningReason.MalwareDetected]);
+ *   1 to 3 light detections is Yellow ([ShieldWarningReason.EnginesFlagged]);
+ * - no key at all: Yellow, never Green; a source that failed (no network, quota, rejected key, timeout) is Yellow with its own
+ *   reason, and a source's failure never hides the other source's answer;
+ * - a file every asked source does not know is Yellow, with an optional upload when [canUpload] and no Red reason exists;
+ *   it is only "unknown" when no asked source failed;
+ * - fewer than [MinVtEngines] engines, or an analysis older than [StaleAnalysisDays], is Yellow;
+ * - a trusted update (same signer, not older) is Green when no engine flags it and the on-device scan found nothing.
+ * Resource-only splits ([ShieldFileEvidence.lookedUp] false) are ignored for the online rules.
  */
 fun evaluateShieldVerdict(
     sha256: String,
@@ -273,34 +406,41 @@ fun evaluateShieldVerdict(
     hasKey: Boolean,
     trustedUpdate: Boolean,
     files: List<ShieldFileEvidence>,
+    canUpload: Boolean = true,
+    displayName: String? = null,
+    nowEpochSeconds: Long = System.currentTimeMillis() / 1000L,
 ): ShieldVerdict {
-    fun warning(vararg reasons: ShieldWarningReason, malicious: Int = 0, total: Int = 0) =
-        ShieldVerdict.Warning(sha256, reasons.toList(), malicious, total, offline)
+    val report = buildShieldReport(displayName ?: files.firstOrNull()?.name.orEmpty(), sha256, files)
+    val reasons = LinkedHashSet<ShieldWarningReason>(offline.reasons)
+    val unknown = mutableListOf<ReportFile>()
 
-    if (offline.reasons.isNotEmpty()) return ShieldVerdict.Warning(sha256, offline.reasons, 0, 0, offline)
-
-    val found = files.mapNotNull { it.vt as? VtLookupResult.Found }
-    val flagged = found.filter { it.malicious > 0 || it.suspicious > 0 }
-        .maxByOrNull { it.malicious + it.suspicious }
-    if (flagged != null) {
-        return warning(ShieldWarningReason.MalwareDetected, malicious = flagged.malicious + flagged.suspicious, total = flagged.total)
+    when (report.level) {
+        EngineLevel.Severe -> reasons += ShieldWarningReason.MalwareDetected
+        EngineLevel.Light -> reasons += ShieldWarningReason.EnginesFlagged
+        EngineLevel.Clean -> Unit
     }
-
-    if (trustedUpdate) return ShieldVerdict.Clean(sha256, vtSummaryOf(found), offline, trustedUpdate = true)
-
-    if (!hasKey) return warning(ShieldWarningReason.VirusTotalKeyMissing)
-    val unreachable = files.isEmpty() || files.any {
-        it.vt == VtLookupResult.Unavailable || it.vt == VtLookupResult.RateLimited || it.vt == VtLookupResult.InvalidKey
+    if (report.level != EngineLevel.Severe && !trustedUpdate) {
+        if (!hasKey) reasons += ShieldWarningReason.VirusTotalKeyMissing
+        else collectOnlineGaps(report.files.filter { it.lookedUp }, nowEpochSeconds, reasons, unknown)
     }
-    if (unreachable) return warning(ShieldWarningReason.VirusTotalUnreachable)
-    if (found.any { it.total < MinVtEngines }) return warning(ShieldWarningReason.TooFewEngines)
-
-    val unknown = files.filter { it.vt == VtLookupResult.UnknownHash }
     if (unknown.isNotEmpty()) {
-        if (unknown.any { it.sizeBytes > MaxVtUploadBytes }) return warning(ShieldWarningReason.TooLargeToVerify)
-        return ShieldVerdict.NeedsUpload(sha256, unknown.map { UploadCandidate(it.name, it.sizeBytes, it.sha256) }, offline)
+        val hasRed = reasons.any { it.severity() == SecuritySeverity.Red }
+        // The upload is not offered while a service is failing for another file: the answer would not be trusted either.
+        val serviceFailing = reasons.any {
+            it == ShieldWarningReason.VirusTotalUnreachable || it == ShieldWarningReason.OnlineRateLimited ||
+                it == ShieldWarningReason.OnlineKeyRejected
+        }
+        if (!hasRed && !serviceFailing && canUpload && unknown.none { it.sizeBytes > MaxVtUploadBytes }) {
+            return ShieldVerdict.NeedsUpload(sha256, unknown.map { UploadCandidate(it.name, it.sizeBytes, it.sha256) }, offline, report)
+        }
+        reasons += ShieldWarningReason.NotKnownToVirusTotal
     }
-    return ShieldVerdict.Clean(sha256, vtSummaryOf(found), offline)
+    // A lone self-updater permission is how every self-updating app works: information, not a warning.
+    if (reasons.size == 1 && ShieldWarningReason.SelfUpdaterPermission in reasons) reasons.clear()
+    if (reasons.isEmpty()) {
+        return ShieldVerdict.Clean(sha256, report.summary, offline, trustedUpdate = trustedUpdate, report = report)
+    }
+    return ShieldVerdict.Warning(sha256, orderedByGravity(reasons), report.flaggedEngines, report.totalEngines, offline, report)
 }
 
 // ---- Offline APK & Bundle analysis ----
@@ -321,14 +461,22 @@ fun analyzePackageOffline(
     candidateVersionCode: Long? = null,
     candidateDebugOrTest: Boolean = false,
     candidateCertSubject: String? = null,
+    candidateMinSdk: Int? = null,
+    candidateTargetSdk: Int? = null,
+    candidateLineageSha256: Collection<String> = emptyList(),
 ): OfflineScanReport {
     var allSigned = true
+    var anyCompromised = false
+    var anyV1Only = false
+    var anyV2Plus = false
+    var structureProblem: String? = null
     var anyDebugOrTest = candidateDebugOrTest
     var primarySignerSha256: String? = candidateSigSha256?.normalizeHexSha256()
     var primaryCertSubject: String? = candidateCertSubject?.takeIf { it.isNotBlank() }
     var detectedVersionCode: Long? = candidateVersionCode
     val riskPermissions = LinkedHashSet<String>()
     val allPermissions = LinkedHashSet<String>()
+    val capabilities = LinkedHashSet<String>()
 
     try {
         if (bundle.format == PackageFormat.SingleApk || bundle.apks.isEmpty()) {
@@ -338,11 +486,16 @@ fun analyzePackageOffline(
                 val apkInspection = inspectSingleApkFile(sourceFile)
                 allSigned = apkInspection.signed || primarySignerSha256 != null
                 if (apkInspection.debugOrTestSigned) anyDebugOrTest = true
+                if (apkInspection.compromised) anyCompromised = true
+                if (apkInspection.v1Only) anyV1Only = true
+                if (apkInspection.hasV2Plus) anyV2Plus = true
+                structureProblem = structureProblem ?: apkInspection.structureProblem
                 if (primarySignerSha256 == null) primarySignerSha256 = apkInspection.signerSha256
                 if (primaryCertSubject == null) primaryCertSubject = apkInspection.certSubject
                 if (detectedVersionCode == null) detectedVersionCode = apkInspection.versionCode
                 riskPermissions += apkInspection.highRiskPermissions
                 allPermissions += apkInspection.allPermissions
+                capabilities += apkInspection.capabilities
             }
         } else {
             val baseApk = bundle.findBaseApk()
@@ -350,8 +503,13 @@ fun analyzePackageOffline(
                 val apkInspection = inspectExtractedApk(split)
                 if (!apkInspection.signed) allSigned = false
                 if (apkInspection.debugOrTestSigned) anyDebugOrTest = true
+                if (apkInspection.compromised) anyCompromised = true
+                if (apkInspection.v1Only) anyV1Only = true
+                if (apkInspection.hasV2Plus) anyV2Plus = true
+                structureProblem = structureProblem ?: apkInspection.structureProblem
                 riskPermissions += apkInspection.highRiskPermissions
                 allPermissions += apkInspection.allPermissions
+                capabilities += apkInspection.capabilities
                 val isBase = baseApk != null && split.entryPath == baseApk.entryPath
                 if (primarySignerSha256 == null || (isBase && apkInspection.signerSha256 != null && candidateSigSha256 == null)) {
                     apkInspection.signerSha256?.let { primarySignerSha256 = it }
@@ -379,20 +537,31 @@ fun analyzePackageOffline(
     if (primarySignerSha256 != null && primarySignerSha256 in KnownTestKeySha256s) {
         anyDebugOrTest = true
     }
+    if (primarySignerSha256 != null && primarySignerSha256 in CompromisedPlatformKeySha256s) {
+        anyCompromised = true
+    }
     if (primaryCertSubject != null && isDebugOrTestCertificateDn(primaryCertSubject)) {
         anyDebugOrTest = true
     }
 
     val normalizedInstalledSig = installedSigSha256?.normalizeHexSha256()
+    val lineage = candidateLineageSha256.mapNotNull { it.normalizeHexSha256() }.toSet()
+    // A new signer is accepted when the installed certificate is an ancestor of it in the APK's v3 rotation lineage.
     val sigMismatch = normalizedInstalledSig != null &&
         primarySignerSha256 != null &&
-        !normalizedInstalledSig.equals(primarySignerSha256, ignoreCase = true)
+        !normalizedInstalledSig.equals(primarySignerSha256, ignoreCase = true) &&
+        normalizedInstalledSig !in lineage
 
     val isDowngrade = installedVersionCode != null &&
         detectedVersionCode != null &&
         detectedVersionCode < installedVersionCode
 
     val reasons = mutableListOf<ShieldWarningReason>()
+    if (structureProblem != null) reasons += ShieldWarningReason.MalformedArchive
+    if (anyV1Only && !anyV2Plus && isV1OnlyRejected(true, false, candidateMinSdk, candidateTargetSdk)) {
+        reasons += ShieldWarningReason.LegacySignatureOnly
+    }
+    if (anyCompromised) reasons += ShieldWarningReason.CompromisedKey
     if (!allSigned) reasons += ShieldWarningReason.UnsignedPackage
     if (allSigned && anyDebugOrTest) reasons += ShieldWarningReason.DebugOrTestCertificate
     if (sigMismatch) reasons += ShieldWarningReason.SignatureMismatch
@@ -409,6 +578,9 @@ fun analyzePackageOffline(
         reasons = reasons,
         allPermissions = allPermissions.sorted(),
         certSubject = primaryCertSubject,
+        issueDetail = structureProblem,
+        signerLineageSha256 = lineage,
+        capabilities = capabilities,
     )
 }
 
@@ -425,6 +597,13 @@ private data class SingleApkInspection(
     val versionCode: Long?,
     val highRiskPermissions: Set<String>,
     val allPermissions: List<String>,
+    val capabilities: Set<String> = emptySet(),
+    val compromised: Boolean = false,
+    /** Signed with a v1 (JAR) signature and no v2/v3 block. */
+    val v1Only: Boolean = false,
+    val hasV2Plus: Boolean = false,
+    /** What is inconsistent in the archive structure (BadPack, Janus polyglot), or null. */
+    val structureProblem: String? = null,
 )
 
 private fun inspectExtractedApk(extracted: ExtractedFile): SingleApkInspection {
@@ -448,6 +627,7 @@ private fun inspectSingleApkFile(apkFile: File): SingleApkInspection {
     var versionCode: Long? = null
     val riskPerms = LinkedHashSet<String>()
     val allPerms = LinkedHashSet<String>()
+    val capabilities = LinkedHashSet<String>()
 
     ZipFile(apkFile).use { zip ->
         val entries = zip.entries()
@@ -467,13 +647,27 @@ private fun inspectSingleApkFile(apkFile: File): SingleApkInspection {
 
         if (manifestEntry != null) {
             val manifestBytes = zip.getInputStream(manifestEntry).use { readBoundedBytes(it, MaxManifestBytes) }
-            val scannedAll = scanManifestPermissions(manifestBytes)
-            allPerms += scannedAll
-            riskPerms += scanManifestRiskPermissions(manifestBytes)
-            for (perm in scannedAll) {
-                if (perm in HighRiskPermissions) riskPerms += perm
+            // The permissions the manifest declares with <uses-permission>; the string scan is only the fallback for a
+            // manifest that is neither binary nor plain XML.
+            val declared = declaredManifestPermissions(manifestBytes)
+            if (declared != null) {
+                allPerms += declared
+                for (perm in declared) {
+                    if (perm in HighRiskPermissions) riskPerms += perm
+                }
+            } else {
+                val scannedAll = scanManifestPermissions(manifestBytes)
+                allPerms += scannedAll
+                riskPerms += scanManifestRiskPermissions(manifestBytes)
+                for (perm in scannedAll) {
+                    if (perm in HighRiskPermissions) riskPerms += perm
+                }
             }
             versionCode = extractManifestVersionCode(manifestBytes)
+            if (declaredServiceGuards(manifestBytes)?.contains("BIND_ACCESSIBILITY_SERVICE") == true) {
+                capabilities += "BIND_ACCESSIBILITY_SERVICE"
+                riskPerms += "BIND_ACCESSIBILITY_SERVICE"
+            }
         }
 
         for (sigEntry in sigEntries) {
@@ -485,24 +679,35 @@ private fun inspectSingleApkFile(apkFile: File): SingleApkInspection {
 
     val v2v3 = inspectApkSigningBlock(apkFile)
     val facts = mergeSignerFacts(v1Certs, v2v3.certs)
+    val structure = if (isJanusPolyglot(apkFile)) "a DEX file is glued in front of the APK (Janus)" else zipStructureProblem(apkFile)
 
     return SingleApkInspection(
         signed = v1Certs.isNotEmpty() || v2v3.present,
+        compromised = facts.compromised,
+        v1Only = v1Certs.isNotEmpty() && !v2v3.present,
+        hasV2Plus = v2v3.present,
+        structureProblem = structure,
         debugOrTestSigned = facts.debugOrTest,
         signerSha256 = facts.signerSha256,
         certSubject = facts.certSubject,
         versionCode = versionCode,
         highRiskPermissions = riskPerms,
         allPermissions = allPerms.sorted(),
+        capabilities = capabilities,
     )
 }
 
-internal data class SignerFacts(val signerSha256: String?, val certSubject: String?, val debugOrTest: Boolean)
+internal data class SignerFacts(
+    val signerSha256: String?,
+    val certSubject: String?,
+    val debugOrTest: Boolean,
+    val compromised: Boolean = false,
+)
 
 /** The v2/v3 signer wins over a v1 certificate (the platform checks v2/v3 first); a test key among ANY certificate flags the package. */
 internal fun mergeSignerFacts(v1: List<ParsedCertInfo>, v2v3: List<ParsedCertInfo>): SignerFacts {
     val primary = v2v3.firstOrNull() ?: v1.firstOrNull()
-    return SignerFacts(primary?.sha256, primary?.subject, (v1 + v2v3).any { it.debugOrTest })
+    return SignerFacts(primary?.sha256, primary?.subject, (v1 + v2v3).any { it.debugOrTest }, (v1 + v2v3).any { it.compromised })
 }
 
 /** True when ANY of the DER [certs] is a public test/debug key. */
@@ -521,6 +726,7 @@ internal data class ParsedCertInfo(
     val sha256: String,
     val debugOrTest: Boolean,
     val subject: String? = null,
+    val compromised: Boolean = false,
 )
 
 private fun containsDnToken(dn: String, token: String): Boolean {
@@ -529,15 +735,28 @@ private fun containsDnToken(dn: String, token: String): Boolean {
         val idx = dn.indexOf(token, startIndex, ignoreCase = true)
         if (idx < 0) return false
         val endIdx = idx + token.length
+        val beforeOk = idx == 0 || !dn[idx - 1].isLetterOrDigit()
         val afterOk = endIdx >= dn.length || !dn[endIdx].isLetterOrDigit()
-        if (afterOk) return true
+        if (beforeOk && afterOk) return true
         startIndex = idx + 1
     }
 }
 
+/** The relative names of a distinguished name as lower-case `key=value` pairs, separated by commas, `/` or `+`. */
+private fun dnParts(dn: String): List<String> =
+    dn.replace("\"", "").split(',', '/', '+').map { it.trim().lowercase(Locale.ROOT).replace(" =", "=").replace("= ", "=") }.filter { it.isNotEmpty() }
+
+/**
+ * True when [dn] is exactly the Android SDK debug certificate: `CN=Android Debug, O=Android, C=US` (three names, in any
+ * order). Nothing less specific counts as a debug certificate.
+ */
+internal fun isAndroidDebugDn(dn: String): Boolean =
+    dnParts(dn).toSet() == setOf("cn=android debug", "o=android", "c=us")
+
+/** True for the exact Android SDK debug DN or for the DN of a public modding tool. [dn] is ONE name: subject or issuer, never both joined. */
 internal fun isDebugOrTestCertificateDn(dn: String): Boolean {
     val normalized = dn.replace("\"", "")
-    return KnownDebugOrTestDnTokens.any { token -> containsDnToken(normalized, token) }
+    return isAndroidDebugDn(normalized) || ModToolDnTokens.any { token -> containsDnToken(normalized, token) }
 }
 
 internal fun parseCertificateBytes(rawBytes: ByteArray): ParsedCertInfo? {
@@ -551,20 +770,19 @@ internal fun parseCertificateBytes(rawBytes: ByteArray): ParsedCertInfo? {
         val x509 = first as? X509Certificate
         val subjectPrincipal = x509?.subjectX500Principal?.name?.trim()?.takeIf { it.isNotEmpty() }
             ?: x509?.subjectDN?.name?.trim()?.takeIf { it.isNotEmpty() }
-        val combinedDn = buildString {
-            append(x509?.subjectX500Principal?.name.orEmpty())
-            append(' ')
-            append(x509?.subjectDN?.name.orEmpty())
-            append(' ')
-            append(x509?.issuerX500Principal?.name.orEmpty())
-            append(' ')
-            append(x509?.issuerDN?.name.orEmpty())
-        }
-        val isDebugCn = isDebugOrTestCertificateDn(combinedDn)
+        // Each name on its own: joined together they would turn two unrelated names into one match.
+        val names = listOf(
+            x509?.subjectX500Principal?.name,
+            x509?.subjectDN?.name,
+            x509?.issuerX500Principal?.name,
+            x509?.issuerDN?.name,
+        ).filterNotNull()
+        val isDebugCn = names.any { isDebugOrTestCertificateDn(it) }
         ParsedCertInfo(
             sha256 = sha256,
             debugOrTest = isDebugCn || sha256 in KnownTestKeySha256s || sha1 == "61ed377e85d386a8dfee6b864bd85b0bfaa5af81",
             subject = subjectPrincipal,
+            compromised = sha256 in CompromisedPlatformKeySha256s,
         )
     } catch (_: Throwable) {
         null
@@ -816,77 +1034,11 @@ fun scanManifestRiskPermissions(manifestBytes: ByteArray): Set<String> {
  */
 fun extractManifestVersionCode(manifestBytes: ByteArray): Long? {
     if (manifestBytes.size >= 8) {
-        parseBinaryAxmlVersionCode(manifestBytes)?.let { return it }
+        axmlVersionCode(manifestBytes)?.let { return it }
     }
     return try {
         val text = manifestBytes.toString(Charsets.UTF_8)
         VersionCodeXmlRegex.find(text)?.groupValues?.get(1)?.toLongOrNull()
-    } catch (_: Throwable) {
-        null
-    }
-}
-
-private const val ResXmlType = 0x0003
-private const val ResXmlResourceMapType = 0x0180
-private const val ResXmlStartElementType = 0x0102
-private const val AttrVersionCodeResId = 0x0101021b
-private const val AttrVersionCodeMajorResId = 0x0101021c
-
-private fun parseBinaryAxmlVersionCode(bytes: ByteArray): Long? {
-    return try {
-        val buf = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
-        val fileType = buf.getShort(0).toInt() and 0xFFFF
-        val fileHeaderSize = buf.getShort(2).toInt() and 0xFFFF
-        if (fileType != ResXmlType || fileHeaderSize < 8) return null
-
-        var offset = fileHeaderSize
-        var versionCodeResIndex = -1
-        var versionCodeMajorResIndex = -1
-
-        while (offset + 8 <= bytes.size) {
-            val chunkType = buf.getShort(offset).toInt() and 0xFFFF
-            val headerSize = buf.getShort(offset + 2).toInt() and 0xFFFF
-            val chunkSize = buf.getInt(offset + 4)
-            if (chunkSize < 8 || offset + chunkSize > bytes.size) break
-
-            when (chunkType) {
-                ResXmlResourceMapType -> {
-                    val count = (chunkSize - headerSize) / 4
-                    for (i in 0 until count) {
-                        val resId = buf.getInt(offset + headerSize + i * 4)
-                        if (resId == AttrVersionCodeResId) versionCodeResIndex = i
-                        if (resId == AttrVersionCodeMajorResId) versionCodeMajorResIndex = i
-                    }
-                }
-                ResXmlStartElementType -> {
-                    if (offset + 36 <= bytes.size && versionCodeResIndex >= 0) {
-                        val attrStart = buf.getShort(offset + 16 + 12).toInt() and 0xFFFF
-                        val attrSize = buf.getShort(offset + 16 + 14).toInt() and 0xFFFF
-                        val attrCount = buf.getShort(offset + 16 + 16).toInt() and 0xFFFF
-                        val step = if (attrSize >= 20) attrSize else 20
-                        var attrPos = offset + 16 + attrStart
-                        var low: Long? = null
-                        var high = 0L
-                        for (i in 0 until attrCount) {
-                            if (attrPos + 20 > offset + chunkSize) break
-                            val nameIdx = buf.getInt(attrPos + 4)
-                            val dataType = bytes[attrPos + 15].toInt() and 0xFF
-                            val data = buf.getInt(attrPos + 16)
-                            if (dataType in 0x10..0x1F) {
-                                if (nameIdx == versionCodeResIndex) low = data.toLong() and 0xFFFFFFFFL
-                                if (nameIdx == versionCodeMajorResIndex) high = data.toLong() and 0xFFFFFFFFL
-                            }
-                            attrPos += step
-                        }
-                        if (low != null) {
-                            return (high shl 32) or low
-                        }
-                    }
-                }
-            }
-            offset += chunkSize
-        }
-        null
     } catch (_: Throwable) {
         null
     }
@@ -961,6 +1113,12 @@ data class InstalledAppInfo(
     val certSubject: String? = null,
     val appName: String? = null,
     val versionName: String? = null,
+    val minSdk: Int? = null,
+    val targetSdk: Int? = null,
+    /** SHA-256 of the certificates in the APK's signing lineage (v3 rotation), oldest first; empty without rotation. */
+    val lineageSha256: List<String> = emptyList(),
+    /** The device could not be asked (the shell call failed): the installed version is unknown, not "not installed". */
+    val queryFailed: Boolean = false,
 )
 
 /** Parses `dumpsys package <pkg>` output for `versionCode` and optional signer SHA-256. */
@@ -982,7 +1140,8 @@ fun queryInstalledAppInfo(
     localContext: Context? = null,
 ): InstalledAppInfo {
     val safePkg = sanitizePackageName(packageName)
-    val dumpsys = runCatching { adb.shell("dumpsys package $safePkg") }.getOrDefault("")
+    val dumpsysResult = runCatching { adb.shell("dumpsys package $safePkg") }
+    val dumpsys = dumpsysResult.getOrDefault("")
     val parsed = parseDumpsysInstalledApp(dumpsys)
 
     var versionCode = parsed.versionCode
@@ -1000,9 +1159,9 @@ fun queryInstalledAppInfo(
             if (versionName == null) versionName = info.versionName
             appName = runCatching { info.applicationInfo?.loadLabel(localContext.packageManager)?.toString() }.getOrNull()
             if (sigSha256 == null) {
+                // apkContentsSigners holds the current signer even after a key rotation; the history starts with the oldest.
                 val signer = info.signingInfo?.let { si ->
-                    if (si.hasMultipleSigners()) si.apkContentsSigners?.firstOrNull()
-                    else si.signingCertificateHistory?.firstOrNull()
+                    si.apkContentsSigners?.firstOrNull() ?: si.signingCertificateHistory?.lastOrNull()
                 }
                 if (signer != null) {
                     sigSha256 = sha256Hex(ByteArrayInputStream(signer.toByteArray()))
@@ -1017,6 +1176,7 @@ fun queryInstalledAppInfo(
         sigSha256 = sigSha256,
         appName = appName,
         versionName = versionName,
+        queryFailed = dumpsysResult.isFailure,
     )
 }
 
@@ -1028,18 +1188,23 @@ fun queryArchiveAppInfo(context: Context, apkFile: File): InstalledAppInfo {
             PackageManager.GET_SIGNING_CERTIFICATES,
         ) ?: return InstalledAppInfo(null, null)
         val signer = info.signingInfo?.let { si ->
-            if (si.hasMultipleSigners()) si.apkContentsSigners?.firstOrNull()
-            else si.signingCertificateHistory?.firstOrNull()
+            si.apkContentsSigners?.firstOrNull() ?: si.signingCertificateHistory?.lastOrNull()
         }
         val signerBytes = signer?.toByteArray()
         val parsedCert = signerBytes?.let(::parseCertificateBytes)
         val sigSha256 = parsedCert?.sha256 ?: signerBytes?.let { sha256Hex(ByteArrayInputStream(it)) }
         val allSigners = info.signingInfo?.apkContentsSigners.orEmpty().map { it.toByteArray() }
+        // The lineage is only trusted when the platform itself parsed a proof of rotation out of the APK.
+        val lineage = info.signingInfo?.takeIf { it.hasPastSigningCertificates() && !it.hasMultipleSigners() }
+            ?.signingCertificateHistory.orEmpty().map { sha256Hex(ByteArrayInputStream(it.toByteArray())) }
         InstalledAppInfo(
             versionCode = info.longVersionCode,
             sigSha256 = sigSha256,
             debugOrTestSigned = parsedCert?.debugOrTest == true || anyCertDebugOrTest(allSigners),
             certSubject = parsedCert?.subject,
+            minSdk = info.applicationInfo?.minSdkVersion,
+            targetSdk = info.applicationInfo?.targetSdkVersion,
+            lineageSha256 = lineage,
         )
     } catch (_: Throwable) {
         InstalledAppInfo(null, null)
@@ -1092,12 +1257,35 @@ private fun parseVirusTotalFile(body: String, sha256: String): VtLookupResult = 
     val stats = attributes.getJSONObject("last_analysis_stats")
     val date = attributes.optLong("last_analysis_date", -1L).takeIf { it > 0L }
     if (!data.optString("id").equals(sha256, ignoreCase = true) || date == null) VtLookupResult.Unavailable
-    else vtStatsToFound(stats, date) ?: VtLookupResult.Unavailable
+    else vtStatsToFound(stats, date)?.copy(detections = parseVirusTotalDetections(attributes.optJSONObject("last_analysis_results")))
+        ?: VtLookupResult.Unavailable
 } catch (_: JSONException) {
     VtLookupResult.Unavailable
 }
 
-/** `analysed 3 days ago` for the terminal log; the age is shown, never used to decide. */
+private const val MaxEngineFlags = 200
+
+/**
+ * The engines that flagged the file in `last_analysis_results` (`{"<engine>": {"category": "malicious", "result": "Trojan.X"}}`):
+ * those with category `malicious` or `suspicious`. Missing or malformed results give an empty list; the counters always
+ * come from `last_analysis_stats`.
+ */
+internal fun parseVirusTotalDetections(results: JSONObject?): List<EngineFlag> {
+    if (results == null) return emptyList()
+    val flags = mutableListOf<EngineFlag>()
+    val names = results.keys()
+    while (names.hasNext() && flags.size < MaxEngineFlags) {
+        val engine = names.next()
+        val item = results.optJSONObject(engine) ?: continue
+        val category = item.optString("category").lowercase(Locale.ROOT)
+        if (category != "malicious" && category != "suspicious") continue
+        val label = if (item.isNull("result")) "" else item.optString("result").trim()
+        flags += EngineFlag(engine, label, category)
+    }
+    return flags.sortedBy { it.engine.lowercase(Locale.ROOT) }
+}
+
+/** `analysed 3 days ago` for the terminal log. The decision uses [isStaleAnalysis]. */
 internal fun analysisAgeText(lastAnalysisDate: Long?, nowEpochSeconds: Long): String {
     if (lastAnalysisDate == null) return "analysis date unknown"
     val days = ((nowEpochSeconds - lastAnalysisDate) / 86_400L).coerceAtLeast(0L)
@@ -1110,7 +1298,7 @@ internal fun analysisAgeText(lastAnalysisDate: Long?, nowEpochSeconds: Long): St
 
 /**
  * Queries VirusTotal v3 (`GET https://www.virustotal.com/api/v3/files/$sha256`) with header `x-apikey: $apiKey`.
- * Never throws: any network or I/O error returns [VtLookupResult.Unavailable] (which blocks the install).
+ * Never throws: any network or I/O error returns [VtLookupResult.Unavailable] (the Shield then says "not checked online").
  */
 fun checkVirusTotalHash(sha256: String, apiKey: String, timeoutMs: Int = 10_000): VtLookupResult {
     val cleanHash = sha256.normalizeHexSha256() ?: return VtLookupResult.Unavailable
@@ -1136,6 +1324,7 @@ private const val ShieldPrefsName = "shield_settings"
 private const val KeyShieldEnabled = "shield_enabled"
 private const val KeyDeepScanEnabled = "deep_scan_enabled"
 private const val KeyVtApiKeyCiphertext = "vt_api_key_enc"
+private const val KeyMdApiKeyCiphertext = "md_api_key_enc"
 private const val VtKeyStoreAlias = "gogo_vt_key_aes"
 private const val AesGcmTransformation = "AES/GCM/NoPadding"
 private const val GcmIvBytes = 12
@@ -1174,7 +1363,7 @@ internal fun decryptApiKeyWithSecretKey(encoded: String, secretKey: SecretKey): 
 }
 
 /**
- * Persists Antivirus Shield settings in [SharedPreferences], encrypting the user's VirusTotal API key at rest
+ * Persists Antivirus Shield settings in [SharedPreferences], encrypting the user's VirusTotal and MetaDefender API keys at rest
  * with an Android Keystore `AES/GCM/NoPadding` secret key (`alias = "gogo_vt_key_aes"`).
  */
 class ShieldSettingsStore(
@@ -1197,61 +1386,110 @@ class ShieldSettingsStore(
             runCatching { prefs.edit().putBoolean(KeyDeepScanEnabled, value).apply() }
         }
 
-    fun hasVirusTotalApiKey(): Boolean =
-        runCatching { !prefs.getString(KeyVtApiKeyCiphertext, null).isNullOrBlank() }.getOrDefault(false)
+    fun hasVirusTotalApiKey(): Boolean = hasKey(KeyVtApiKeyCiphertext)
 
-    fun loadVirusTotalApiKey(): String? {
-        val encoded = runCatching { prefs.getString(KeyVtApiKeyCiphertext, null) }.getOrNull()
+    fun loadVirusTotalApiKey(): String? = loadKey(KeyVtApiKeyCiphertext)
+
+    fun saveVirusTotalApiKey(rawKey: String?): Boolean = saveKey(KeyVtApiKeyCiphertext, rawKey)
+
+    fun clearVirusTotalApiKey() = clearKey(KeyVtApiKeyCiphertext)
+
+    fun hasMetaDefenderApiKey(): Boolean = false
+
+    fun loadMetaDefenderApiKey(): String? = null
+
+    fun saveMetaDefenderApiKey(rawKey: String?): Boolean = false
+
+    fun clearMetaDefenderApiKey() = clearKey(KeyMdApiKeyCiphertext)
+
+    /** True when VirusTotal has a key: without it, the Shield runs in limited (on-device only) mode. */
+    fun hasAnyApiKey(): Boolean = hasVirusTotalApiKey()
+
+    private fun hasKey(slot: String): Boolean =
+        runCatching { !prefs.getString(slot, null).isNullOrBlank() }.getOrDefault(false)
+
+    private fun loadKey(slot: String): String? {
+        val encoded = runCatching { prefs.getString(slot, null) }.getOrNull()
             ?.takeIf { it.isNotBlank() } ?: return null
         return try {
             decryptApiKeyWithSecretKey(encoded, keyProvider())
         } catch (e: CancellationException) {
             throw e
         } catch (t: Throwable) {
-            if (isKeyGone(t)) {
-                runCatching { prefs.edit().remove(KeyVtApiKeyCiphertext).apply() }
-            }
+            // Only a key that can never decrypt again is forgotten. A temporary Keystore failure (boot, locked screen)
+            // must not cost the user their API key: the key stays and the next call tries again.
+            if (isPermanentKeyFailure(t)) runCatching { prefs.edit().remove(slot).apply() }
             null
         }
     }
 
-    fun saveVirusTotalApiKey(rawKey: String?): Boolean {
+    private fun saveKey(slot: String, rawKey: String?): Boolean {
         val clean = rawKey?.trim().orEmpty()
         if (clean.isEmpty()) {
-            clearVirusTotalApiKey()
+            clearKey(slot)
             return true
         }
         return try {
             val encrypted = encryptApiKeyWithSecretKey(clean, keyProvider())
-            prefs.edit().putString(KeyVtApiKeyCiphertext, encrypted).apply()
+            prefs.edit().putString(slot, encrypted).apply()
             true
         } catch (e: CancellationException) {
             throw e
         } catch (_: Throwable) {
-            false
+            try {
+                val store = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+                runCatching { store.deleteEntry(VtKeyStoreAlias) }
+                val encrypted = encryptApiKeyWithSecretKey(clean, keyProvider())
+                prefs.edit().putString(slot, encrypted).apply()
+                true
+            } catch (_: Throwable) {
+                false
+            }
         }
     }
 
-    fun clearVirusTotalApiKey() {
-        runCatching { prefs.edit().remove(KeyVtApiKeyCiphertext).apply() }
+    private fun clearKey(slot: String) {
+        runCatching { prefs.edit().remove(slot).apply() }
     }
 }
 
+/**
+ * True when [t] means the stored ciphertext can never be decrypted again: the Keystore key was replaced (the GCM tag no
+ * longer matches), permanently invalidated or unrecoverable, or the stored text is not valid Base64. Anything else is
+ * treated as temporary.
+ */
+internal fun isPermanentKeyFailure(t: Throwable): Boolean =
+    t is javax.crypto.AEADBadTagException ||
+        t is java.security.UnrecoverableKeyException ||
+        t is android.security.keystore.KeyPermanentlyInvalidatedException ||
+        t is IllegalArgumentException
+
 private fun getOrCreateAndroidKeystoreAesKey(): SecretKey {
     val store = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
-    (store.getKey(VtKeyStoreAlias, null) as? SecretKey)?.let { return it }
-    return KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore").apply {
-        init(
-            KeyGenParameterSpec.Builder(
-                VtKeyStoreAlias,
-                KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT,
+    try {
+        (store.getKey(VtKeyStoreAlias, null) as? SecretKey)?.let { return it }
+    } catch (t: Throwable) {
+        // A temporary failure must not delete the key: every stored API key would be lost with it.
+        if (!isPermanentKeyFailure(t)) throw t
+        runCatching { store.deleteEntry(VtKeyStoreAlias) }
+    }
+    return try {
+        KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore").apply {
+            init(
+                KeyGenParameterSpec.Builder(
+                    VtKeyStoreAlias,
+                    KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT,
+                )
+                    .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                    .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                    .setKeySize(256)
+                    .build(),
             )
-                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
-                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
-                .setKeySize(256)
-                .build(),
-        )
-    }.generateKey()
+        }.generateKey()
+    } catch (t: Throwable) {
+        runCatching { store.deleteEntry(VtKeyStoreAlias) }
+        throw t
+    }
 }
 
 // ---- Re-check before streaming ----

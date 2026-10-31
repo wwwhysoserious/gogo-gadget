@@ -1,9 +1,7 @@
 package app.gogogadget
 
-import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -19,10 +17,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.selection.selectable
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -34,15 +29,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.text.input.ImeAction
-import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 
@@ -53,13 +44,18 @@ private fun label(setting: ThemeSetting): Int = when (setting) {
     ThemeSetting.Dark -> R.string.theme_dark
 }
 
+private fun deleteModeLabel(mode: DeleteSourceMode): Int = when (mode) {
+    DeleteSourceMode.Off -> R.string.delete_apk_off
+    DeleteSourceMode.On -> R.string.delete_apk_on
+    DeleteSourceMode.Automatic -> R.string.delete_apk_auto
+}
+
 /** A settings row; [onClick] null means display-only placeholder. */
 @Composable
 private fun SettingRow(
     palette: Palette,
     name: Int,
     value: String,
-    leadingIcon: (@Composable () -> Unit)? = null,
     onClick: (() -> Unit)? = null,
 ) {
     Divider(palette)
@@ -70,10 +66,6 @@ private fun SettingRow(
             .padding(horizontal = Margin, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        if (leadingIcon != null) {
-            leadingIcon()
-            Spacer(Modifier.width(10.dp))
-        }
         Text(
             stringResource(name),
             style = MaterialTheme.typography.bodyLarge,
@@ -120,6 +112,7 @@ fun SettingsScreen(
     onSelect: (ThemeSetting) -> Unit,
     vtKeyOpen: Boolean = false,
     onVtKeyOpen: (Boolean) -> Unit = {},
+    onKeysChanged: () -> Unit = {},
 ) {
     if (themeOpen) {
         ThemePicker(palette, selected, onSelect, onBack = { onThemeOpen(false) })
@@ -135,27 +128,14 @@ fun SettingsScreen(
     val shieldStore = remember(context) { ShieldSettingsStore(context) }
     val installStore = remember(context) { InstallSettingsStore(context) }
     var homeShortcut by rememberSaveable { mutableStateOf(installStore.homeShortcut) }
-    var deleteApk by rememberSaveable { mutableStateOf(installStore.deleteApk) }
+    var deleteMode by rememberSaveable { mutableStateOf(installStore.deleteSourceMode) }
+    var backupBeforeUpdate by rememberSaveable { mutableStateOf(installStore.backupBeforeUpdate) }
     var shieldEnabled by rememberSaveable { mutableStateOf(shieldStore.shieldEnabled) }
-    var hasVtKey by rememberSaveable { mutableStateOf(shieldStore.hasVirusTotalApiKey()) }
+    var hasApiKey by rememberSaveable { mutableStateOf(shieldStore.hasAnyApiKey()) }
     var deepScanEnabled by rememberSaveable { mutableStateOf(shieldStore.deepScanEnabled) }
 
     if (vtKeyOpen) {
-        VirusTotalKeyScreen(
-            palette = palette,
-            hasKey = hasVtKey,
-            onSave = { rawKey ->
-                shieldStore.saveVirusTotalApiKey(rawKey)
-                hasVtKey = shieldStore.hasVirusTotalApiKey()
-                onVtKeyOpen(false)
-            },
-            onClear = {
-                shieldStore.clearVirusTotalApiKey()
-                hasVtKey = false
-                onVtKeyOpen(false)
-            },
-            onBack = { onVtKeyOpen(false) },
-        )
+        SecurityApisScreen(palette, shieldStore, onChanged = { hasApiKey = shieldStore.hasAnyApiKey(); shieldEnabled = shieldStore.shieldEnabled; onKeysChanged() }, onBack = { onVtKeyOpen(false) })
         return
     }
 
@@ -176,32 +156,30 @@ fun SettingsScreen(
             palette = palette,
             name = R.string.antivirus_shield,
             value = s(if (shieldEnabled) R.string.on else R.string.off),
-            leadingIcon = {
-                SecurityShieldIcon(
-                    color = Color(if (shieldEnabled) palette.success else palette.secondary),
-                    modifier = Modifier.size(20.dp),
-                )
-            },
             onClick = {
                 val next = !shieldEnabled
                 shieldEnabled = next
                 shieldStore.shieldEnabled = next
+                onKeysChanged()
             },
         )
         SettingRow(
             palette = palette,
-            name = R.string.virustotal_key,
-            value = s(if (hasVtKey) R.string.virustotal_key_set else R.string.virustotal_key_required),
+            name = R.string.security_apis,
+            value = if (!shieldEnabled) s(R.string.disabled_by_shield) else s(if (hasApiKey) R.string.on else R.string.api_status_none),
             onClick = { onVtKeyOpen(true) },
         )
         SettingRow(
             palette = palette,
             name = R.string.deep_scan,
-            value = s(if (deepScanEnabled) R.string.on else R.string.off),
+            value = if (!shieldEnabled) s(R.string.disabled_by_shield) else s(if (deepScanEnabled) R.string.on else R.string.off),
             onClick = {
-                val next = !deepScanEnabled
-                deepScanEnabled = next
-                shieldStore.deepScanEnabled = next
+                if (shieldEnabled) {
+                    val next = !deepScanEnabled
+                    deepScanEnabled = next
+                    shieldStore.deepScanEnabled = next
+                    onKeysChanged()
+                }
             },
         )
         GroupHeader(palette, R.string.group_installation)
@@ -218,16 +196,32 @@ fun SettingsScreen(
         SettingRow(
             palette = palette,
             name = R.string.delete_apk,
-            value = s(if (deleteApk) R.string.on else R.string.off),
+            value = s(deleteModeLabel(deleteMode)),
             onClick = {
-                val next = !deleteApk
-                deleteApk = next
-                installStore.deleteApk = next
+                val next = nextDeleteSourceMode(deleteMode)
+                deleteMode = next
+                installStore.deleteSourceMode = next
             },
         )
-        SettingRow(palette, R.string.backup_before_update, s(R.string.on))
+        SettingRow(
+            palette = palette,
+            name = R.string.backup_before_update,
+            value = s(if (backupBeforeUpdate) R.string.on else R.string.off),
+            onClick = {
+                val next = !backupBeforeUpdate
+                backupBeforeUpdate = next
+                installStore.backupBeforeUpdate = next
+            },
+        )
         GroupHeader(palette, R.string.group_language)
-        SettingRow(palette, R.string.language, s(R.string.language_value))
+        SettingRow(
+            palette = palette,
+            name = R.string.language,
+            value = languageRowLabel(currentAppLocaleTag(context), s(R.string.language_value)),
+            onClick = if (appLanguageSupported(android.os.Build.VERSION.SDK_INT)) {
+                { openAppLanguageSettings(context) }
+            } else null,
+        )
         GroupHeader(palette, R.string.group_about)
         SettingRow(palette, R.string.version, version)
         SettingRow(palette, R.string.source_code, s(R.string.github))
@@ -319,92 +313,5 @@ private fun IconPicker(palette: Palette, selected: AppIcon, onSelect: (AppIcon) 
             color = Color(palette.secondary),
             modifier = Modifier.padding(horizontal = Margin, vertical = 16.dp),
         )
-    }
-}
-
-@Composable
-private fun VirusTotalKeyScreen(
-    palette: Palette,
-    hasKey: Boolean,
-    onSave: (String) -> Unit,
-    onClear: () -> Unit,
-    onBack: () -> Unit,
-) {
-    var keyInput by remember { mutableStateOf("") }
-    fun submitSave() {
-        val clean = keyInput.trim()
-        if (clean.isNotEmpty()) {
-            keyInput = ""
-            onSave(clean)
-        }
-    }
-    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
-        Row(Modifier.fillMaxWidth().height(56.dp), verticalAlignment = Alignment.CenterVertically) {
-            Text(
-                stringResource(R.string.back),
-                style = MaterialTheme.typography.bodyMedium,
-                color = Color(palette.accent),
-                modifier = Modifier.clickable(role = Role.Button, onClick = onBack).height(56.dp)
-                    .padding(horizontal = Margin).padding(vertical = 16.dp),
-            )
-        }
-        Divider(palette)
-        Text(
-            stringResource(R.string.virustotal_key),
-            style = MaterialTheme.typography.bodyMedium,
-            color = Color(palette.secondary),
-            modifier = Modifier.padding(horizontal = Margin, vertical = 16.dp).semantics { heading() },
-        )
-        Divider(palette)
-        Column(Modifier.fillMaxWidth().padding(horizontal = Margin, vertical = 16.dp)) {
-            Field(
-                palette = palette,
-                value = keyInput,
-                onValue = { keyInput = it.trim() },
-                hint = R.string.virustotal_key_hint,
-                keyboard = KeyboardType.Password,
-                mono = true,
-                imeAction = ImeAction.Done,
-                onDone = ::submitSave,
-                visualTransformation = PasswordVisualTransformation('\u2022'),
-            )
-            Text(
-                stringResource(R.string.virustotal_key_help),
-                style = MaterialTheme.typography.bodySmall,
-                color = Color(palette.secondary),
-                modifier = Modifier.padding(vertical = 8.dp),
-            )
-            Spacer(Modifier.height(8.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(
-                    onClick = ::submitSave,
-                    enabled = keyInput.isNotBlank(),
-                    modifier = Modifier.weight(1f).height(48.dp),
-                    shape = RectangleShape,
-                    colors = ButtonDefaults.buttonColors(),
-                    elevation = null,
-                ) {
-                    Text(stringResource(R.string.save), style = MaterialTheme.typography.labelLarge)
-                }
-                if (hasKey) {
-                    OutlinedButton(
-                        onClick = {
-                            keyInput = ""
-                            onClear()
-                        },
-                        modifier = Modifier.weight(1f).height(48.dp),
-                        shape = RectangleShape,
-                        border = BorderStroke(1.dp, Color(palette.error)),
-                    ) {
-                        Text(
-                            stringResource(R.string.clear),
-                            style = MaterialTheme.typography.labelLarge,
-                            color = Color(palette.error),
-                        )
-                    }
-                }
-            }
-        }
-        Divider(palette)
     }
 }

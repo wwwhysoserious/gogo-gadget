@@ -8,14 +8,24 @@ import java.io.IOException
 import java.io.InputStream
 import java.net.ConnectException
 import java.net.NoRouteToHostException
+import java.net.SocketException
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
+import java.security.InvalidKeyException
+import java.security.KeyManagementException
+import java.security.KeyStoreException
+import java.security.NoSuchAlgorithmException
+import java.security.ProviderException
+import java.security.UnrecoverableKeyException
 import javax.net.ssl.SSLException
 
 // Pure logic for the ADB layer: no Android classes, no network, fully unit-tested.
 
-/** A device to connect to. [port] 0 means "look it up by mDNS". */
-data class Target(val name: String, val host: String, val port: Int)
+/**
+ * A device to connect to. [port] 0 means "look it up by mDNS". [deviceId] names the ADB key of a saved network device;
+ * null on this phone and on devices saved by 0.9.24 or earlier, which keep using the shared key.
+ */
+data class Target(val name: String, val host: String, val port: Int, val subnet: String? = null, val deviceId: String? = null)
 
 /** [Remote] is the Android/Google TV remote service: every such device announces it, debugging on or not. */
 enum class FoundKind { Connect, Pairing, Remote }
@@ -25,7 +35,7 @@ data class Found(val name: String, val host: String, val port: Int, val kind: Fo
 
 data class Endpoint(val host: String, val port: Int)
 
-private fun normalise(host: String): String =
+internal fun normalise(host: String): String =
     host.trim().removeSurrounding("[", "]").substringBefore('%').lowercase().removePrefix("::ffff:")
 
 private fun ipv4Octets(host: String): List<Int>? {
@@ -55,15 +65,21 @@ fun isValidHost(host: String): Boolean {
     return h.split('.').all { HostLabel.matches(it) }
 }
 
-/** Private or link-local addresses only: the app never talks to the internet. */
+/** Tailscale's CGNAT range, 100.64.0.0/10 (the VPN interface, often named tun or tailscale). */
+internal fun isTailscaleV4(host: String): Boolean = ipv4Octets(normalise(host))?.let { (a, b) -> a == 100 && b in 64..127 } == true
+
+/** True when this phone has an address in the Tailscale range (100.64.0.0/10), i.e. it is on a tailnet. */
+internal fun hasTailscaleAddress(own: Collection<String>): Boolean = own.any { isTailscaleV4(it.trim().substringBefore('%')) }
+
+/** Private, link-local or Tailscale (CGNAT, fd7a:115c:a1e0::/48, *.ts.net) addresses only: the app never talks to the internet. */
 fun isLanHost(host: String): Boolean {
     val h = normalise(host)
     ipv4Octets(h)?.let { (a, b) ->
-        return a == 10 || a == 127 || (a == 172 && b in 16..31) || (a == 192 && b == 168) || (a == 169 && b == 254)
+        return a == 10 || a == 127 || (a == 172 && b in 16..31) || (a == 192 && b == 168) || (a == 169 && b == 254) || isTailscaleV4(h)
     }
     if (':' in h) return h == "::1" || h.startsWith("fe8") || h.startsWith("fe9") || h.startsWith("fea") ||
         h.startsWith("feb") || h.startsWith("fc") || h.startsWith("fd")
-    return h == "localhost" || h.endsWith(".local")
+    return h == "localhost" || h.endsWith(".local") || h.endsWith(".ts.net")
 }
 
 /** Validates the manual-entry fields; a blank port means 0 (find it by mDNS), a typed one must be valid. */
@@ -124,6 +140,7 @@ enum class AdbError(val message: Int) {
     WrongCode(R.string.err_wrong_code),
     TlsFailed(R.string.err_tls_failed),
     PairingUnreachable(R.string.err_pairing_unreachable),
+    PairingClosed(R.string.err_pairing_closed),
     NoConnectPort(R.string.err_no_connect_port),
     PairingRequired(R.string.err_pairing_required),
     KeyError(R.string.err_key),
@@ -138,13 +155,20 @@ enum class Phase { Pair, Connect, Session }
 /** The app's own ADB key could not be loaded or created. */
 class AdbKeyException(cause: Throwable) : Exception("The ADB key could not be loaded", cause)
 
+/** The key could not be loaded, made or used: our own wrapper, or what the JCA and the Keystore throw for it. */
+private fun isKeyFailure(t: Throwable) = t is AdbKeyException || t is InvalidKeyException || t is KeyStoreException ||
+    t is UnrecoverableKeyException || t is ProviderException
+
 /**
- * Maps a failure to the short message shown to the user. While pairing only the errors that really mean a refused
- * code say so (the device closes the connection, or the encrypted exchange does not complete); a failed TLS
- * handshake, an unreachable service or anything else gets its own message.
+ * Maps a failure to the short message shown to the user. A key that cannot be loaded or made is a [AdbError.KeyError]
+ * in every phase. While pairing only the errors that really mean a refused code say so (the device closes the
+ * connection, or the encrypted exchange does not complete); a failed TLS handshake, an unreachable service, a
+ * connection Android closed or anything else gets its own message. Unknown failures stay [AdbError.Failed]; callers
+ * keep [diagnostic] of them.
  */
 fun classifyError(e: Throwable, phase: Phase, local: Boolean): AdbError {
     val chain = generateSequence(e) { it.cause }.take(8).toList()
+    if (chain.any(::isKeyFailure)) return AdbError.KeyError
     if (phase == Phase.Pair) return classifyPairing(chain)
     return when {
         chain.any { it is AdbPairingRequiredException || it is AdbAuthenticationFailedException } -> AdbError.PairingRequired
@@ -161,13 +185,23 @@ fun classifyError(e: Throwable, phase: Phase, local: Boolean): AdbError {
 // Messages thrown by libadb-android's PairingConnectionCtx when the SPAKE2 exchange ends without success.
 private val PairingRefusedMessages = listOf("Exchanging message wasn't successful", "Could not exchange peer info")
 
+// The pairing connection ended under us: libadb's own "closed with errors", or a socket the peer reset or closed.
+private val PairingClosedMessages = listOf("Connection closed with errors")
+private val SocketClosedHints = listOf("reset", "closed", "broken pipe", "abort", "eof")
+
+// A socket that could not even be opened because the system forbids it (data saver, firewall, VPN lockdown).
+private val SocketBlockedHints = listOf("eperm", "eacces", "operation not permitted", "permission denied")
+
+private fun Throwable.says(hints: List<String>) = message?.lowercase()?.let { m -> hints.any { it in m } } == true
+
 private fun classifyPairing(chain: List<Throwable>): AdbError = when {
-    chain.any { it is AdbKeyException } -> AdbError.KeyError
-    chain.any { it is SSLException } -> AdbError.TlsFailed
+    chain.any { it is SSLException || it is NoSuchAlgorithmException || it is KeyManagementException } -> AdbError.TlsFailed
     chain.any { it is ConnectException || it is SocketTimeoutException || it is NoRouteToHostException ||
-        it is UnknownHostException } -> AdbError.PairingUnreachable
+        it is UnknownHostException || (it is SocketException && it.says(SocketBlockedHints)) } -> AdbError.PairingUnreachable
     chain.any { it is EOFException || PairingRefusedMessages.any { m -> it.message?.contains(m) == true } } ->
         AdbError.WrongCode
+    chain.any { (it is SocketException && it.says(SocketClosedHints)) || PairingClosedMessages.any { m -> it.message?.contains(m) == true } } ->
+        AdbError.PairingClosed
     else -> AdbError.Failed
 }
 
@@ -178,18 +212,29 @@ private val LongToken = Regex("[A-Za-z0-9+/=_-]{32,}")
 private const val DetailMaxLength = 160
 private const val DetailChainLength = 3
 
+/** Digit runs of the length of a pairing code and anything that looks like key material become placeholders. */
+fun maskSecrets(text: String): String = text.replace(SixDigits, "******").replace(LongToken, "...")
+
 /**
  * One short line for the error screen: exception class and message of the failure and its causes. Digit runs of
  * the length of a pairing code and anything that looks like key material are masked; the code itself is never
  * passed in here.
  */
 fun diagnostic(e: Throwable): String =
-    generateSequence(e) { it.cause }.take(DetailChainLength)
-        .joinToString(" < ") { t -> (t.javaClass.simpleName.ifEmpty { t.javaClass.name } + (t.message?.let { ": $it" } ?: "")) }
-        .map { if (it.isISOControl()) ' ' else it }.joinToString("")
-        .replace(SixDigits, "******")
-        .replace(LongToken, "...")
-        .take(DetailMaxLength)
+    maskSecrets(
+        generateSequence(e) { it.cause }.take(DetailChainLength)
+            .joinToString(" < ") { t -> (t.javaClass.simpleName.ifEmpty { t.javaClass.name } + (t.message?.let { ": $it" } ?: "")) }
+            .map { if (it.isISOControl()) ' ' else it }.joinToString(""),
+    ).take(DetailMaxLength)
+
+/** The class name of [e] alone (no message, no package): the one thing a notification may say about a failure. */
+fun exceptionName(e: Throwable): String = e.javaClass.simpleName.ifEmpty { e.javaClass.name.substringAfterLast('.') }
+
+/** The notification text of a result: the message, and a second "Details" line when there is one. */
+fun failureText(message: String, detailsLine: String?): String = if (detailsLine == null) message else "$message\n$detailsLine"
+
+/** A terminal log line for a failed [step], e.g. `> pair: failed - IOException: Broken pipe`. */
+fun failureLine(step: String, e: Throwable): String = "> $step: failed - ${diagnostic(e)}"
 
 // ---- Installing ----
 
@@ -210,12 +255,16 @@ fun shouldRetryWithoutBypass(output: String): Boolean {
     return "unknown option" in o || "unknown argument" in o || ("bypass-low-target-sdk-block" in o && "error" in o)
 }
 
+/** Android blocks test-only APKs unless -t is passed. */
+fun isTestOnlyFailure(output: String): Boolean =
+    "INSTALL_FAILED_TEST_ONLY" in output
+
 /** PackageManager.INSTALL_REASON_USER: with it, a new install makes the launcher add the app icon to the home screen. */
 const val InstallReasonUser = 4
 
 /** Streams an APK of [size] bytes from stdin, so nothing has to be readable on the device. */
-fun streamInstallCommand(size: Long, bypass: Boolean, userInstall: Boolean = false): String =
-    "cmd package install -S $size -r -d${if (bypass) " --bypass-low-target-sdk-block" else ""}" +
+fun streamInstallCommand(size: Long, bypass: Boolean, userInstall: Boolean = false, testOnly: Boolean = false): String =
+    "cmd package install -S $size -r -d${if (testOnly) " -t" else ""}${if (bypass) " --bypass-low-target-sdk-block" else ""}" +
         if (userInstall) " --install-reason $InstallReasonUser" else ""
 
 /** Where the in-app pairing form for another device stands, from the typed code and the pairing port (null until mDNS sees the dialog). */
@@ -236,6 +285,9 @@ enum class LocalPairingStatus { WaitingForDialog, DialogFound }
 
 fun localPairingStatus(port: Int?): LocalPairingStatus =
     if (port != null) LocalPairingStatus.DialogFound else LocalPairingStatus.WaitingForDialog
+
+/** The "Open Wireless debugging" button pulses until the system pairing dialog has been found. */
+fun shouldPulseWirelessButton(status: LocalPairingStatus): Boolean = status == LocalPairingStatus.WaitingForDialog
 
 const val PairingCodeLength = 6
 
@@ -314,9 +366,12 @@ fun mergeByHost(found: List<Found>, ownAddresses: Collection<String>): List<NetD
     return hosts.values.toList()
 }
 
-/** Port for a network device: the one given, else the Wireless debugging port seen by mDNS, else 5555. */
-fun networkConnectPort(explicit: Int, mdnsPort: Int?): Int =
-    explicit.takeIf { it > 0 } ?: mdnsPort ?: ClassicAdbPort
+/**
+ * Ports to try for a network device, best first and without repeats: the one mDNS announces now, the one of the last
+ * good connection (a hint only), then the classic 5555.
+ */
+fun connectPortCandidates(mdnsPort: Int?, lastGoodPort: Int?, defaultPort: Int = ClassicAdbPort): List<Int> =
+    listOfNotNull(mdnsPort, lastGoodPort, defaultPort).filter { it in 1..65535 }.distinct()
 
 /** mDNS connect port of the network device at [host], if any. */
 fun mdnsConnectPort(host: String, found: List<Found>): Int? =
@@ -442,26 +497,110 @@ fun installErrorIsConnectionLoss(sessionConnected: Boolean): Boolean = !sessionC
 
 // ---- Recent devices (name, host, port only: nothing secret) ----
 
-const val MaxRecent = 5
-
 private fun clean(s: String) = s.replace('\t', ' ').replace('\n', ' ').trim()
 
-fun encodeRecents(list: List<Target>): String =
-    list.joinToString("\n") { "${clean(it.name)}\t${clean(it.host)}\t${it.port}" }
+/**
+ * One line per device: name, host, port, (empty when unknown) the /24 subnet it was saved on and, for a network device
+ * with a key of its own, its device id. A device without an id is written as the four-field line of 0.9.24.
+ */
+fun encodeRecents(list: List<Target>): String = list.joinToString("\n") {
+    val line = "${clean(it.name)}\t${clean(it.host)}\t${it.port}\t${clean(it.subnet.orEmpty())}"
+    if (it.deviceId == null) line else "$line\t${clean(it.deviceId)}"
+}
 
+/** Reads the three- and four-field lines of older versions too: their subnet and device id are unknown. */
 fun decodeRecents(text: String?): List<Target> =
     text.orEmpty().lines().mapNotNull { line ->
         val f = line.split('\t')
         val port = f.getOrNull(2)?.toIntOrNull()
-        if (f.size == 3 && f[1].isNotEmpty() && port != null && port in 0..65535) Target(f[0], f[1], port) else null
+        if (f.size in 3..5 && f[1].isNotEmpty() && port != null && port in 0..65535) {
+            val s3 = f.getOrNull(3)?.takeIf { it.isNotEmpty() }
+            val s4 = f.getOrNull(4)?.takeIf { it.isNotEmpty() }
+            val (subnet, deviceId) = when {
+                f.size == 5 -> s3?.takeIf(::isValidSubnet) to s4?.takeIf(::isValidDeviceId)
+                f.size == 4 -> if (isValidSubnet(s3)) s3 to null else null to s3?.takeIf(::isValidDeviceId)
+                else -> null to null
+            }
+            Target(f[0], f[1], port, subnet, deviceId)
+        } else null
     }
+
+/**
+ * Gives [target] the device id its key is named by. This phone and a target that has one stay as they are; a saved
+ * device keeps what it was saved with (no id: the shared key of earlier versions); anything else is a new device and
+ * gets the id from [newId], so a device that was forgotten never falls back to the shared key.
+ */
+fun withDeviceId(target: Target, recent: List<Target>, own: Collection<String>, newId: () -> String): Target {
+    if (isLocalHost(target.host, own) || target.deviceId != null) return target
+    val saved = recent.firstOrNull { normalise(it.host) == normalise(target.host) }
+    return if (saved != null) target.copy(deviceId = saved.deviceId) else target.copy(deviceId = newId())
+}
 
 /** Connect ports change whenever Wireless debugging is toggled, so recents keep none and use mDNS. */
 fun forgetPorts(list: List<Target>): List<Target> = list.map { it.copy(port = 0) }
 
-/** Puts [target] first; a device already listed (same host, or both this device) is not repeated. */
+/** Puts [target] first; a device already listed (same host, or both this device) is not repeated. Nothing is dropped. */
 fun addRecent(list: List<Target>, target: Target, ownAddresses: Collection<String>): List<Target> {
     fun same(a: Target) = normalise(a.host) == normalise(target.host) ||
         (isLocalHost(a.host, ownAddresses) && isLocalHost(target.host, ownAddresses))
-    return (listOf(target) + list.filterNot(::same)).take(MaxRecent)
+    return (listOf(target) + list.filterNot(::same))
+}
+
+/**
+ * Drops every entry with the same host as [target] (compared like [addRecent] does); the order of the rest is kept.
+ * When [target] is this phone, every entry for this phone goes, whatever address it was saved with.
+ */
+fun removeRecent(list: List<Target>, target: Target, ownAddresses: Collection<String> = emptyList()): List<Target> {
+    val local = isLocalHost(target.host, ownAddresses)
+    return list.filterNot { normalise(it.host) == normalise(target.host) || (local && isLocalHost(it.host, ownAddresses)) }
+}
+
+/**
+ * What the connection becomes when [target] is forgotten: back to "not connected" if the session (connected,
+ * connecting, pairing or failed) is with that device, the same [Connection] otherwise. This phone matches whatever
+ * address it was reached with.
+ */
+fun connectionAfterForget(connection: Connection, target: Target, ownAddresses: Collection<String> = emptyList()): Connection {
+    val device = connection.device ?: return connection
+    val same = normalise(device.host) == normalise(target.host) ||
+        (isLocalHost(device.host, ownAddresses) && isLocalHost(target.host, ownAddresses))
+    return if (same) Connection() else connection
+}
+
+/** With no saved device left the app goes back to what a first open looks like. */
+fun shouldResetToFirstRun(recent: List<Target>): Boolean = recent.isEmpty()
+
+/** Only the hosts that are still saved: a forgotten device must not stay "available" from an older probe. */
+fun keepSavedHosts(hosts: Set<String>, recent: List<Target>): Set<String> {
+    val saved = recent.map { normalise(it.host) }.toSet()
+    return hosts.filterTo(LinkedHashSet()) { normalise(it) in saved }
+}
+
+/**
+ * What forgetting a device does, decided before anything is touched. [endSession]: the current connection, connecting
+ * or pairing is with that device, so it is closed and [connection] goes back to "not connected"; otherwise the session
+ * of another device is left alone, also while this phone's key is deleted. [stopPairing]: the notification service
+ * goes first whenever the session ends or this phone's key is about to go, so it cannot pair with a key being deleted.
+ * [doomed] are the keys to delete afterwards: this phone's, the own key of a network device that has one, or
+ * [IdentityName.Everything] when no device is left. The shared key is never among them for a single device.
+ */
+data class ForgetPlan(
+    val connection: Connection,
+    val endSession: Boolean,
+    val recent: List<Target>,
+    val resetToFirstRun: Boolean,
+    val doomed: Set<IdentityName>,
+    val stopPairing: Boolean,
+)
+
+fun planForget(connection: Connection, recent: List<Target>, target: Target, own: Collection<String>): ForgetPlan {
+    val after = connectionAfterForget(connection, target, own)
+    val endSession = after !== connection
+    val left = removeRecent(recent, target, own)
+    val reset = shouldResetToFirstRun(left)
+    // The saved entry knows the key it was paired with; the target a screen passes may not carry the id.
+    val saved = recent.firstOrNull { it !in left } ?: target
+    val doomed = identitiesToDelete(identityFor(saved.host, own, saved.deviceId), reset)
+    val ownKey = IdentityName.Local in doomed || IdentityName.Everything in doomed
+    return ForgetPlan(after, endSession, left, reset, doomed, stopPairing = endSession || ownKey)
 }

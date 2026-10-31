@@ -9,8 +9,8 @@ class ConnectionStateTest {
         Connection(state, local?.let { Device("Pixel", "127.0.0.1", 37215, it) })
 
     @Test fun buttonFollowsState() {
-        assertEquals(ButtonSpec(R.string.choose_device, ButtonAction.ChooseDevice), buttonFor(ConnectionState.NotConnected))
-        assertEquals(ButtonSpec(R.string.choose_device, ButtonAction.ChooseDevice), buttonFor(ConnectionState.Error))
+        assertEquals(ButtonSpec(R.string.connect_to_device, ButtonAction.ChooseDevice), buttonFor(ConnectionState.NotConnected))
+        assertEquals(ButtonSpec(R.string.connect_to_device, ButtonAction.ChooseDevice), buttonFor(ConnectionState.Error))
         assertEquals(ButtonSpec(R.string.cancel, ButtonAction.Cancel), buttonFor(ConnectionState.Pairing))
         assertEquals(ButtonSpec(R.string.cancel, ButtonAction.Cancel), buttonFor(ConnectionState.Connecting))
         assertEquals(ButtonSpec(R.string.choose_package, ButtonAction.ChoosePackage), buttonFor(ConnectionState.Connected))

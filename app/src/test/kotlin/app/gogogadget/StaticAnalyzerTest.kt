@@ -112,25 +112,21 @@ class StaticAnalyzerTest {
         assertTrue("Clean DEX must pass inspection with 0 issues, but found: $issues", issues.isEmpty())
     }
 
-    // 2. DEX containing DexClassLoader triggers DropperDetected
+    // 2. DEX containing DexClassLoader alone does NOT trigger DropperDetected (Audit F3 & Owner Decision 6)
     @Test
-    fun dexContainingDexClassLoaderTriggersDropperDetected() {
+    fun dexContainingDexClassLoaderAloneDoesNotTriggerDropperDetected() {
         val dex = buildTestDex(listOf("com.modded.app", "dalvik.system.DexClassLoader"))
         val strings = StaticAnalyzer.parseDexStrings(dex)
         val issues = StaticAnalyzer.inspectDexStrings(strings, "classes.dex")
-        assertEquals(1, issues.size)
-        assertEquals(ShieldWarningReason.DropperDetected, issues[0].reason)
-        assertTrue(issues[0].detail.contains("DexClassLoader"))
+        assertTrue("Mere type reference to DexClassLoader must not trigger DropperDetected", issues.isEmpty())
     }
 
     @Test
-    fun dexContainingInMemoryDexClassLoaderTriggersDropperDetected() {
+    fun dexContainingInMemoryDexClassLoaderAloneDoesNotTriggerDropperDetected() {
         val dex = buildTestDex(listOf("com.modded.app", "dalvik.system.InMemoryDexClassLoader"))
         val strings = StaticAnalyzer.parseDexStrings(dex)
         val issues = StaticAnalyzer.inspectDexStrings(strings, "classes.dex")
-        assertEquals(1, issues.size)
-        assertEquals(ShieldWarningReason.DropperDetected, issues[0].reason)
-        assertTrue(issues[0].detail.contains("InMemoryDexClassLoader"))
+        assertTrue("Mere type reference to InMemoryDexClassLoader must not trigger DropperDetected", issues.isEmpty())
     }
 
     @Test
@@ -144,7 +140,20 @@ class StaticAnalyzerTest {
         val issues = StaticAnalyzer.inspectDexStrings(strings, "classes.dex")
         assertEquals(1, issues.size)
         assertEquals(ShieldWarningReason.DropperDetected, issues[0].reason)
+        assertEquals(IssueCode.LoaderWithPath, issues[0].code)
         assertTrue(issues[0].detail.contains("PathClassLoader"))
+    }
+
+    @Test
+    fun dexContainingPathClassLoaderWithBenignStoragePathDoesNotTriggerDropper() {
+        val dex = buildTestDex(listOf(
+            "com.modded.app",
+            "dalvik.system.PathClassLoader",
+            "/storage/emulated/0/Download",
+        ))
+        val strings = StaticAnalyzer.parseDexStrings(dex)
+        val issues = StaticAnalyzer.inspectDexStrings(strings, "classes.dex")
+        assertTrue("PathClassLoader with ordinary storage path must not trigger DropperDetected", issues.isEmpty())
     }
 
     // 3. APK containing hidden executable payload in assets triggers DropperDetected
@@ -263,22 +272,23 @@ class StaticAnalyzerTest {
     // 4. DEX containing known adware SDK string triggers AdwareDetected
     @Test
     fun dexContainingKnownAdwareSdkStringTriggersAdwareDetected() {
-        val dex = buildTestDex(listOf("com.example.app", "com.airpush.android.Airpush"))
+        val dex = buildTestDex(listOf("com.example.app", "Lcom/airpush/android/Airpush;"))
         val strings = StaticAnalyzer.parseDexStrings(dex)
         val issues = StaticAnalyzer.inspectDexStrings(strings, "classes.dex")
         assertEquals(1, issues.size)
         assertEquals(ShieldWarningReason.AdwareDetected, issues[0].reason)
-        assertTrue(issues[0].detail.contains("com.airpush"))
+        assertEquals(IssueCode.AdwareSdk, issues[0].code)
+        assertEquals("com.airpush", issues[0].param)
     }
 
     @Test
     fun dexContainingMultipleKnownAdwareSdksTriggersAdwareDetected() {
         val sdks = listOf(
-            "com.leadbolt.AdController",
-            "com.kuguo.push.Main",
-            "com.startapp.android.publish.Ads",
-            "com.secneo.apkwrapper",
-            "com.adwhirl.AdWhirlLayout",
+            "Lcom/leadbolt/AdController;",
+            "Lcom/kuguo/push/Main;",
+            "Lcom/adwhirl/AdWhirlLayout;",
+            "Lcom/revmob/RevMobAds;",
+            "Lcom/waps/Offers;",
         )
         for (sdk in sdks) {
             val dex = buildTestDex(listOf("com.example.app", sdk))
@@ -306,15 +316,17 @@ class StaticAnalyzerTest {
         )
         assertNotNull(overlayIssue)
         assertEquals(ShieldWarningReason.AbusivePermissions, overlayIssue?.reason)
+        assertEquals(IssueCode.InstallOverlay, overlayIssue?.code)
         assertTrue(overlayIssue?.detail?.contains("SYSTEM_ALERT_WINDOW") == true)
 
-        // SMS + REQUEST_INSTALL_PACKAGES in non-SMS app
+        // SMS + REQUEST_INSTALL_PACKAGES in non-SMS app -> Yellow (RiskyPermissionCombo) per F15
         val smsIssue = StaticAnalyzer.checkAbusivePermissions(
             permissions = listOf("android.permission.REQUEST_INSTALL_PACKAGES", "android.permission.RECEIVE_SMS"),
             packageName = "com.puzzle.game",
         )
         assertNotNull(smsIssue)
-        assertEquals(ShieldWarningReason.AbusivePermissions, smsIssue?.reason)
+        assertEquals(ShieldWarningReason.RiskyPermissionCombo, smsIssue?.reason)
+        assertEquals(IssueCode.InstallSms, smsIssue?.code)
         assertTrue(smsIssue?.detail?.contains("SMS") == true)
 
         // REQUEST_INSTALL_PACKAGES requested by non-store application
@@ -324,6 +336,7 @@ class StaticAnalyzerTest {
         )
         assertNotNull(nonStoreIssue)
         assertEquals(ShieldWarningReason.SelfUpdaterPermission, nonStoreIssue?.reason)
+        assertEquals(IssueCode.SelfUpdater, nonStoreIssue?.code)
         assertTrue(nonStoreIssue?.detail?.contains("com.cool.flashlight") == true)
 
         // App store requesting REQUEST_INSTALL_PACKAGES passes clean

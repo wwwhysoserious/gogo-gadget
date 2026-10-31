@@ -10,7 +10,18 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import java.io.IOException
 import java.net.Inet4Address
+import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.Socket
 import java.net.NetworkInterface
 import java.util.concurrent.Executor
 
@@ -24,13 +35,60 @@ interface DeviceDiscovery {
 
     /** Starts the discovery over, to catch a service that appeared while it was running. */
     fun restart()
+
+    /** Adds the hosts a subnet scan found answering on their ADB port; the previous scan's results are replaced. */
+    fun publishProbed(items: List<Found>)
+}
+
+/** Active sweep of the /24 of this phone's private LAN addresses. Tailscale or other VPN devices are never discovered, only added by hand. */
+object SubnetScanner {
+    const val PORT = 5555
+    const val TIMEOUT_MS = 600
+    const val PARALLEL = 48
+    private const val MAX_SUBNETS = 4
+
+    /** Hosts worth a probe: .1-.254 of each /24 of this phone's private LAN addresses (never 100.64.0.0/10). Never this phone. */
+    fun candidates(own: Collection<String>): List<String> {
+        val ownNorm = own.map(::normalise).toSet()
+        val lan = own.map { it.trim().substringBefore('%') }.filter(::isPrivateLanV4).mapNotNull(::subnetOf).distinct()
+        return lan.take(MAX_SUBNETS).flatMap { subnet -> (1..254).map { "$subnet.$it" } }
+            .map(::normalise).filter { it !in ownNorm }.distinct()
+    }
+
+    /** Probes [hosts] on [PORT] at most [PARALLEL] at a time and returns those that accept a connection, as Connect entries. */
+    suspend fun scan(
+        hosts: List<String>,
+        names: Map<String, String> = emptyMap(),
+        reachable: (String, Int, Int) -> Boolean = ::tcpOpen,
+    ): List<Found> = withContext(Dispatchers.IO) {
+        val gate = Semaphore(PARALLEL)
+        hosts.map { host -> async { gate.withPermit { host.takeIf { reachable(it, PORT, TIMEOUT_MS) } } } }
+            .awaitAll().filterNotNull()
+            .map { host -> Found(names[normalise(host)] ?: resolveName(host), host, PORT, FoundKind.Connect) }
+    }
+
+    private fun tcpOpen(host: String, port: Int, timeoutMs: Int): Boolean = try {
+        Socket().use { it.connect(InetSocketAddress(host, port), timeoutMs) }
+        true
+    } catch (e: IOException) {
+        false
+    }
+
+    /** The reverse-DNS name when the network has one, otherwise the IP. */
+    private suspend fun resolveName(host: String): String {
+        val name = withTimeoutOrNull(1_000) {
+            withContext(Dispatchers.IO) { runCatching { InetAddress.getByName(host).canonicalHostName }.getOrNull() }
+        }
+        return name?.takeIf { it.isNotBlank() && it != host } ?: host
+    }
 }
 
 /** Every address of this device's own network interfaces. */
 fun ownAddresses(): Set<String> = runCatching {
+    // One broken interface (a tun or tailscale one coming up or down) must not hide the others.
     NetworkInterface.getNetworkInterfaces().toList()
-        .flatMap { it.inetAddresses.toList() }
-        .mapNotNull { it.hostAddress }
+        .flatMap { runCatching { it.inetAddresses.toList() }.getOrDefault(emptyList()) }
+        .mapNotNull { it.hostAddress?.substringBefore('%') }
         .toSet()
 }.getOrDefault(emptySet())
 
@@ -72,6 +130,7 @@ class NsdDiscovery(context: Context) : DeviceDiscovery {
     override fun release() {
         if (users == 0 || --users > 0) return
         stopListeners()
+        probed = emptyList()
         state.value = emptyList()
     }
 
@@ -188,6 +247,20 @@ class NsdDiscovery(context: Context) : DeviceDiscovery {
             info.host
         }
         return address?.hostAddress
+    }
+
+    private var probed: List<Found> = emptyList()
+
+    @Synchronized
+    override fun publishProbed(items: List<Found>) {
+        if (users == 0) return
+        val old = probed.toSet()
+        probed = items
+        state.update { list ->
+            val kept = list.filterNot { it in old }
+            // An mDNS entry for the same host is better (real port and name): the sweep only fills the gaps.
+            kept + items.filter { i -> kept.none { it.kind == FoundKind.Connect && normalise(it.host) == normalise(i.host) } }
+        }
     }
 
     private fun publish(resolved: NsdServiceInfo, kind: FoundKind) {

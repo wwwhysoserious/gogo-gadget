@@ -67,6 +67,16 @@ class AdbLogicTest {
         }
     }
 
+    @Test fun tailscaleAddressesAreAccepted() {
+        for (ok in listOf("100.64.0.1", "100.100.1.2", "100.127.255.254", "fd7a:115c:a1e0::1", "my-tv.tail1234.ts.net")) {
+            assertTrue(ok, isLanHost(ok))
+            assertTrue(ok, isValidHost(ok))
+        }
+        for (bad in listOf("100.63.255.255", "100.128.0.1")) assertFalse(bad, isLanHost(bad))
+        assertEquals(Endpoint("100.101.102.103", 5555), parseEndpoint("100.101.102.103", "5555"))
+        assertTrue(isLocalHost("100.64.0.9", setOf("100.64.0.9")))
+    }
+
     @Test fun endpointNeedsAHostAndAValidOrBlankPort() {
         assertEquals(Endpoint("192.168.1.30", 40123), parseEndpoint(" 192.168.1.30 ", "40123"))
         assertEquals(Endpoint("192.168.1.30", 0), parseEndpoint("192.168.1.30", " "))
@@ -217,6 +227,12 @@ class AdbLogicTest {
     @Test fun installCommandUsesTheDocumentedFlags() {
         assertEquals("cmd package install -S 1234 -r -d --bypass-low-target-sdk-block", streamInstallCommand(1234, bypass = true))
         assertEquals("cmd package install -S 1234 -r -d", streamInstallCommand(1234, bypass = false))
+        assertEquals("cmd package install -S 1234 -r -d -t --bypass-low-target-sdk-block", streamInstallCommand(1234, bypass = true, testOnly = true))
+    }
+
+    @Test fun testOnlyFailureIsDetected() {
+        assertEquals(true, isTestOnlyFailure("Failure [INSTALL_FAILED_TEST_ONLY: install -t flag is required]"))
+        assertEquals(false, isTestOnlyFailure("Failure [INSTALL_FAILED_ALREADY_EXISTS]"))
     }
 
     @Test fun installCommandAppendsTheUserInstallReasonOnlyWhenAsked() {
@@ -244,12 +260,82 @@ class AdbLogicTest {
         assertEquals(listOf(list[1]), decodeRecents("garbage\nTV\t192.168.1.50\t42000\nx\t\t1\nx\ty\tz"))
     }
 
+    @Test fun recentsKeepTheirSubnetAndOldLinesDecodeWithoutOne() {
+        val list = listOf(Target("TV", "192.168.1.50", 0, "192.168.1"), Target("Box", "10.0.0.7", 0))
+        assertEquals(list, decodeRecents(encodeRecents(list)))
+        // Lines written by older versions have three fields.
+        assertEquals(listOf(Target("TV", "192.168.1.50", 42000)), decodeRecents("TV\t192.168.1.50\t42000"))
+        assertEquals(emptyList<Target>(), decodeRecents("a\tb\t1\tc\td\te"))
+    }
+
+    @Test fun recentsKeepTheDeviceIdAndOldLinesDecodeWithoutOne() {
+        val withId = Target("TV", "192.168.1.50", 0, "192.168.1", "a1b2c3")
+        val legacy = Target("Box", "10.0.0.7", 0, "10.0.0")
+        val list = listOf(withId, legacy)
+        assertEquals(list, decodeRecents(encodeRecents(list)))
+        // No id: the line is the one 0.9.24 wrote, so an older app still reads it.
+        assertEquals("Box\t10.0.0.7\t0\t10.0.0", encodeRecents(listOf(legacy)))
+        assertEquals(listOf(legacy.copy(subnet = null)), decodeRecents("Box\t10.0.0.7\t0"))
+        assertEquals(listOf(legacy), decodeRecents("Box\t10.0.0.7\t0\t10.0.0"))
+        // An id with no subnet keeps its column.
+        val noSubnet = Target("TV", "192.168.1.50", 0, null, "a1b2c3")
+        assertEquals(listOf(noSubnet), decodeRecents(encodeRecents(listOf(noSubnet))))
+        // An id that could not be a file name is dropped, never used in a path.
+        assertEquals(listOf(Target("TV", "192.168.1.50", 0, "192.168.1")), decodeRecents("TV\t192.168.1.50\t0\t192.168.1\t../x"))
+    }
+
     @Test fun recentsStripSeparatorsFromNames() {
         val decoded = decodeRecents(encodeRecents(listOf(Target("a\tb\nc", "10.0.0.2", 1))))
         assertEquals(listOf(Target("a b c", "10.0.0.2", 1)), decoded)
     }
 
-    @Test fun recentsPutTheLatestFirstWithoutDuplicatesAndStaySmall() {
+    @Test fun removeRecentDropsTheDeviceByHostAndKeepsTheOrderOfTheRest() {
+        val a = Target("A", "192.168.1.50", 0)
+        val b = Target("B", "192.168.1.51", 0)
+        val c = Target("C", "192.168.1.52", 0)
+        assertEquals(listOf(a, c), removeRecent(listOf(a, b, c), b))
+        // Same host with another name or port is the same device.
+        assertEquals(listOf(a, c), removeRecent(listOf(a, b, c), Target("other", "192.168.1.51", 5555)))
+        assertEquals(listOf(a, b, c), removeRecent(listOf(a, b, c), Target("D", "192.168.1.60", 0)))
+        assertEquals(emptyList<Target>(), removeRecent(emptyList(), a))
+    }
+
+    @Test fun removeRecentOfThisPhoneDropsEveryEntryForIt() {
+        val own = listOf("192.168.1.20")
+        val phone = Target("Phone", "192.168.1.20", 0)
+        val loopback = Target("Phone", "127.0.0.1", 0)
+        val other = Target("B", "192.168.1.51", 0)
+        assertEquals(listOf(other), removeRecent(listOf(phone, other, loopback), phone, own))
+        assertEquals(listOf(other), removeRecent(listOf(phone, other, loopback), loopback, own))
+        // Forgetting another device never touches this phone.
+        assertEquals(listOf(phone, loopback), removeRecent(listOf(phone, other, loopback), other, own))
+    }
+
+    @Test fun forgettingTheConnectedPhoneEndsItsSession() {
+        val own = listOf("192.168.1.20")
+        val phone = Target("Phone", "127.0.0.1", 0)
+        val connected = Connection(ConnectionState.Connected, Device("Phone", "127.0.0.1", 41000, true))
+        assertEquals(Connection(), connectionAfterForget(connected, phone, own))
+        // Whatever address the phone was saved with.
+        assertEquals(Connection(), connectionAfterForget(connected, Target("Phone", "192.168.1.20", 0), own))
+        val pairing = Connection(ConnectionState.Pairing, Device("Phone", "127.0.0.1", 0, true))
+        assertEquals(Connection(), connectionAfterForget(pairing, phone, own))
+        // Another device's session, or no session, is left alone.
+        val tv = Connection(ConnectionState.Connected, Device("TV", "192.168.1.50", 5555, false))
+        assertEquals(tv, connectionAfterForget(tv, phone, own))
+        assertEquals(Connection(), connectionAfterForget(Connection(), phone, own))
+    }
+
+    @Test fun firstRunResetHappensOnlyWhenNoSavedDeviceIsLeft() {
+        val a = Target("A", "192.168.1.50", 0)
+        val b = Target("B", "192.168.1.51", 0)
+        assertTrue(shouldResetToFirstRun(emptyList()))
+        assertFalse(shouldResetToFirstRun(listOf(a)))
+        assertTrue(shouldResetToFirstRun(removeRecent(listOf(a), a)))
+        assertFalse(shouldResetToFirstRun(removeRecent(listOf(a, b), a)))
+    }
+
+    @Test fun recentsPutTheLatestFirstWithoutDuplicatesAndKeepEverything() {
         val self = Target("Pixel", "127.0.0.1", 0)
         val tv = Target("TV", "192.168.1.50", 42000)
         assertEquals(listOf(tv, self), addRecent(listOf(self, tv), tv, own))
@@ -258,7 +344,7 @@ class AdbLogicTest {
         // This device under any of its own addresses is one entry.
         assertEquals(listOf(self), addRecent(listOf(self.copy(host = "192.168.1.20")), self, own))
         val many = (1..9).fold(emptyList<Target>()) { acc, i -> addRecent(acc, Target("d$i", "10.0.0.$i", i), own) }
-        assertEquals(MaxRecent, many.size)
+        assertEquals(9, many.size)
         assertEquals("d9", many.first().name)
     }
 
@@ -282,6 +368,11 @@ class AdbLogicTest {
     @Test fun localPairingStatusFollowsThePairingPort() {
         assertEquals(LocalPairingStatus.WaitingForDialog, localPairingStatus(null))
         assertEquals(LocalPairingStatus.DialogFound, localPairingStatus(37639))
+    }
+
+    @Test fun wirelessButtonPulsesOnlyUntilTheDialogIsFound() {
+        assertEquals(true, shouldPulseWirelessButton(LocalPairingStatus.WaitingForDialog))
+        assertEquals(false, shouldPulseWirelessButton(LocalPairingStatus.DialogFound))
     }
 
     @Test fun recentsForgetTheirPorts() {

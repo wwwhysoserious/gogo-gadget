@@ -3,13 +3,13 @@ package app.gogogadget
 enum class ConnectionState { NotConnected, Pairing, Connecting, Connected, Error }
 
 /** The device the app is connected (or connecting) to. [local] is decided by [isLocalHost]. */
-data class Device(val name: String, val host: String, val port: Int, val local: Boolean)
+data class Device(val name: String, val host: String, val port: Int, val local: Boolean, val deviceId: String? = null)
 
 data class Connection(
     val state: ConnectionState = ConnectionState.NotConnected,
     val device: Device? = null,
     val error: AdbError? = null,
-    /** Exception class and sanitised message, shown under the error (see [diagnostic]). */
+    /** Exception class and sanitised message, shown under the error on the Home card (see [diagnostic]). */
     val detail: String? = null,
     /** Short line under "Connecting…": where to tap Allow (a string resource). */
     val note: Int? = null,
@@ -20,7 +20,7 @@ enum class ButtonAction { ChooseDevice, Cancel, ChoosePackage }
 data class ButtonSpec(val label: Int, val action: ButtonAction)
 
 fun buttonFor(state: ConnectionState): ButtonSpec = when (state) {
-    ConnectionState.NotConnected, ConnectionState.Error -> ButtonSpec(R.string.choose_device, ButtonAction.ChooseDevice)
+    ConnectionState.NotConnected, ConnectionState.Error -> ButtonSpec(R.string.connect_to_device, ButtonAction.ChooseDevice)
     ConnectionState.Pairing, ConnectionState.Connecting -> ButtonSpec(R.string.cancel, ButtonAction.Cancel)
     ConnectionState.Connected -> ButtonSpec(R.string.choose_package, ButtonAction.ChoosePackage)
 }

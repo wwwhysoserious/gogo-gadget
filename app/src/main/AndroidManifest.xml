@@ -22,6 +22,7 @@
     <application
         android:allowBackup="false"
         android:enableOnBackInvokedCallback="true"
+        android:localeConfig="@xml/locales_config"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:label="@string/app_name"
@@ -40,8 +41,45 @@
 
         <activity
             android:name=".MainActivity"
+            android:launchMode="singleTask"
             android:windowSoftInputMode="adjustResize"
-            android:exported="true" />
+            android:exported="true">
+            <!-- "Open with" on a package: the file is copied at once, since the grant is temporary. Content and file URIs only. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:mimeType="application/vnd.android.package-archive" />
+                <data android:mimeType="application/zip" />
+                <data android:mimeType="application/x-zip-compressed" />
+                <data android:mimeType="application/xapk-package-archive" />
+                <data android:mimeType="application/vnd.apkm" />
+            </intent-filter>
+            <!-- Bundles that file managers report as plain binary: matched by extension (pathPattern needs a host). -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:host="*" />
+                <data android:mimeType="application/octet-stream" />
+                <data android:pathPattern=".*\\.[xX][aA][pP][kK]" />
+                <data android:pathPattern=".*\\.[aA][pP][kK][mM]" />
+                <data android:pathPattern=".*\\.[aA][pP][kK][sS]" />
+            </intent-filter>
+            <!-- Share. -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="application/vnd.android.package-archive" />
+                <data android:mimeType="application/zip" />
+                <data android:mimeType="application/x-zip-compressed" />
+                <data android:mimeType="application/xapk-package-archive" />
+                <data android:mimeType="application/vnd.apkm" />
+                <data android:mimeType="application/octet-stream" />
+            </intent-filter>
+        </activity>
 
         <activity-alias
             android:name=".IconB"

@@ -156,14 +156,14 @@ class SecurityShieldTest {
         assertEquals(VtLookupResult.Unavailable, parseVirusTotalResponse(200, vtBody(date = ""","last_analysis_date":0"""), sha))
     }
 
-    @Test fun analysisAgeIsOnlyDescribedNeverUsedToBlock() {
+    @Test fun analysisAgeTextDescribesTheAge() {
         val now = 1_700_000_000L + 3 * 86_400L + 100L
         assertEquals("analysed 3 days ago", analysisAgeText(1_700_000_000L, now))
         assertEquals("analysed 1 day ago", analysisAgeText(now - 86_400L - 5L, now))
         assertEquals("analysed today", analysisAgeText(now - 10L, now))
         assertEquals("analysed today", analysisAgeText(now + 10_000L, now))
         assertEquals("analysis date unknown", analysisAgeText(null, now))
-        // An old analysis still gives a Found: the age is only logged.
+        // An old analysis still gives a Found: the verdict engine decides what its age means (isStaleAnalysis).
         assertTrue(parseVirusTotalResponse(200, vtBody(date = ""","last_analysis_date":1000"""), sha) is VtLookupResult.Found)
     }
 
@@ -297,6 +297,7 @@ class SecurityShieldTest {
     // ---- Verdict evaluation ----
 
     private val sha = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    private val now = 1_700_000_000L + 100L * 86_400L
     private val cleanOffline = OfflineScanReport(
         signed = true,
         debugOrTestSigned = false,
@@ -308,108 +309,270 @@ class SecurityShieldTest {
         reasons = emptyList(),
     )
 
-    private fun file(name: String, vt: VtLookupResult, size: Long = 1_000_000L, hash: String = name.padEnd(64, '0')) =
-        ShieldFileEvidence(name, size, hash, vt)
+    private fun file(
+        name: String,
+        vt: VtLookupResult?,
+        md: VtLookupResult? = null,
+        size: Long = 1_000_000L,
+        hash: String = name.padEnd(64, '0'),
+    ) = ShieldFileEvidence(name, size, hash, vt = vt, md = md)
 
     private fun verdict(
         files: List<ShieldFileEvidence>,
         offline: OfflineScanReport = cleanOffline,
         hasKey: Boolean = true,
         trusted: Boolean = false,
-    ) = evaluateShieldVerdict(sha, offline, hasKey, trusted, files)
+        canUpload: Boolean = true,
+    ) = evaluateShieldVerdict(sha, offline, hasKey, trusted, files, canUpload, nowEpochSeconds = now)
 
     private fun reasonsOf(v: ShieldVerdict) = (v as ShieldVerdict.Warning).reasons
 
-    private val known = VtLookupResult.Found(0, 0, 62)
+    /** A verdict from a service, analysed one day ago, with the engines that flagged it. */
+    private fun found(flagged: Int, total: Int, vararg names: String, suspicious: Int = 0) = VtLookupResult.Found(
+        malicious = flagged,
+        suspicious = suspicious,
+        total = total,
+        lastAnalysisDate = now - 86_400L,
+        detections = names.mapIndexed { i, label -> EngineFlag("Engine${'A' + i}", label) },
+    )
 
-    @Test fun ruleAOfflineReasonsBlockAndNeverOfferUpload() {
-        val offline = cleanOffline.copy(reasons = listOf(ShieldWarningReason.DebugOrTestCertificate, ShieldWarningReason.VersionDowngrade))
-        val v = verdict(listOf(file("a", VtLookupResult.UnknownHash)), offline = offline)
-        assertEquals(ShieldVerdict.Warning(sha, offline.reasons, 0, 0, offline), v)
-        // Also beats a malware hit, a trusted update and a missing key.
-        assertEquals(offline.reasons, reasonsOf(verdict(listOf(file("a", VtLookupResult.Found(3, 0, 60))), offline, hasKey = false, trusted = true)))
+    private val known = found(0, 62)
+
+    @Test fun offlineYellowPlusFlaggedOnlineIsRedAndTheOnlineResultIsNeverHidden() {
+        // Audit F1: an on-device Yellow used to return before the online result was read.
+        val offline = cleanOffline.copy(reasons = listOf(ShieldWarningReason.DebugOrTestCertificate))
+        val v = verdict(listOf(file("a", found(40, 70))), offline = offline) as ShieldVerdict.Warning
+        assertEquals(listOf(ShieldWarningReason.MalwareDetected, ShieldWarningReason.DebugOrTestCertificate), v.reasons)
+        assertEquals(SecurityTier.Red, securityTierOf(v))
+        assertEquals(40, v.vtMalicious)
+        assertEquals(70, v.vtTotal)
+        assertFalse(mayInstall(v, userOverridden = true))
     }
 
-    @Test fun ruleBFlaggedFileBlocksEvenForTrustedUpdate() {
-        val v = verdict(listOf(file("a", known), file("b", VtLookupResult.Found(5, 1, 70))), trusted = true)
-        assertEquals(ShieldVerdict.Warning(sha, listOf(ShieldWarningReason.MalwareDetected), 6, 70, cleanOffline), v)
-        assertEquals(listOf(ShieldWarningReason.MalwareDetected), reasonsOf(verdict(listOf(file("a", VtLookupResult.Found(0, 1, 70))))))
-        // A flagged file wins over a missing key and over unknown files.
-        assertEquals(listOf(ShieldWarningReason.MalwareDetected), reasonsOf(verdict(listOf(file("a", VtLookupResult.Found(1, 0, 70)), file("b", VtLookupResult.UnknownHash)), hasKey = false)))
+    @Test fun offlineYellowWithACleanOnlineResultStaysYellowAndKeepsTheOnlineSummary() {
+        // Audit F2: the card used to say "no analysis" because the online result was thrown away.
+        val offline = cleanOffline.copy(reasons = listOf(ShieldWarningReason.DebugOrTestCertificate))
+        val v = verdict(listOf(file("a", known)), offline = offline) as ShieldVerdict.Warning
+        assertEquals(listOf(ShieldWarningReason.DebugOrTestCertificate), v.reasons)
+        assertEquals(SecurityTier.Yellow, securityTierOf(v))
+        assertEquals("VirusTotal 0/62", v.report?.summary)
+        assertEquals(62, v.vtTotal)
     }
 
-    @Test fun ruleCTrustedUpdateIsCleanWithoutKeyAndDespiteUnknownOrUnreachable() {
-        val unknown = verdict(listOf(file("a", VtLookupResult.UnknownHash)), hasKey = false, trusted = true)
-        assertEquals(ShieldVerdict.Clean(sha, null, cleanOffline, trustedUpdate = true), unknown)
-        for (vt in listOf(VtLookupResult.Unavailable, VtLookupResult.RateLimited, VtLookupResult.InvalidKey)) {
-            assertEquals(ShieldVerdict.Clean(sha, null, cleanOffline, trustedUpdate = true), verdict(listOf(file("a", vt)), trusted = true))
+    @Test fun offlineYellowStillGetsTheUploadOfferForAnUnknownFile() {
+        val offline = cleanOffline.copy(reasons = listOf(ShieldWarningReason.DropperDetected))
+        assertTrue(verdict(listOf(file("a", VtLookupResult.UnknownHash)), offline = offline) is ShieldVerdict.NeedsUpload)
+        // After the user declines, the same Yellow reasons stay and "not known" joins them.
+        val declined = verdict(listOf(file("a", VtLookupResult.UnknownHash)), offline = offline, canUpload = false)
+        assertEquals(listOf(ShieldWarningReason.DropperDetected, ShieldWarningReason.NotKnownToVirusTotal), reasonsOf(declined))
+    }
+
+    @Test fun offlineRedBlocksAndNeverOffersAnUpload() {
+        val offline = cleanOffline.copy(reasons = listOf(ShieldWarningReason.UnsignedPackage))
+        val v = verdict(listOf(file("a", VtLookupResult.UnknownHash)), offline = offline) as ShieldVerdict.Warning
+        assertTrue(ShieldWarningReason.UnsignedPackage in v.reasons)
+        assertEquals(SecurityTier.Red, securityTierOf(v))
+        assertTrue(verdict(listOf(file("a", found(3, 60, "Android.Trojan.X"))), offline, hasKey = false, trusted = true) is ShieldVerdict.Warning)
+    }
+
+    @Test fun flagsFollowTheOwnersThresholds() {
+        // 0 engines: Green.
+        assertTrue(verdict(listOf(file("a", known))) is ShieldVerdict.Clean)
+        // 1 to 3 light detections: Yellow, the user decides.
+        for (n in 1..3) {
+            val names = Array(n) { "Android.Riskware.Agent.$it" }
+            assertEquals("$n light engines", listOf(ShieldWarningReason.EnginesFlagged), reasonsOf(verdict(listOf(file("a", found(n, 70, *names))))))
         }
-        // Few engines do not block a trusted update either; the summary is shown when VirusTotal answered.
+        // 4 engines: Red even when every name is light.
         assertEquals(
-            ShieldVerdict.Clean(sha, "0/5", cleanOffline, trustedUpdate = true),
-            verdict(listOf(file("a", VtLookupResult.Found(0, 0, 5))), trusted = true),
+            listOf(ShieldWarningReason.MalwareDetected),
+            reasonsOf(verdict(listOf(file("a", found(4, 70, "Adware.A", "Adware.B", "Riskware.C", "PUA.D"))))),
+        )
+        // 1 serious name: Red.
+        assertEquals(
+            listOf(ShieldWarningReason.MalwareDetected),
+            reasonsOf(verdict(listOf(file("a", found(1, 70, "Android.Trojan.SMSreg.X"))))),
+        )
+        // A suspicious verdict counts like a malicious one.
+        assertEquals(
+            listOf(ShieldWarningReason.EnginesFlagged),
+            reasonsOf(verdict(listOf(file("a", found(0, 70, "Android.PUA.Foo", suspicious = 1))))),
         )
     }
 
-    @Test fun ruleDNoKeyBlocksWhenNotATrustedUpdate() {
-        assertEquals(listOf(ShieldWarningReason.VirusTotalKeyMissing), reasonsOf(verdict(listOf(file("a", known)), hasKey = false)))
-        // Test key + unknown hash and no key: a Warning, never an upload offer.
+    @Test fun countsWithoutNamesAreYellowUpToThreeAndRedFromFour() {
+        assertEquals(listOf(ShieldWarningReason.EnginesFlagged), reasonsOf(verdict(listOf(file("a", found(1, 70))))))
+        assertEquals(listOf(ShieldWarningReason.EnginesFlagged), reasonsOf(verdict(listOf(file("a", found(3, 70))))))
+        assertEquals(listOf(ShieldWarningReason.MalwareDetected), reasonsOf(verdict(listOf(file("a", found(4, 70))))))
+    }
+
+    @Test fun twoSourcesCountDistinctEnginesOnly() {
+        val vt = found(2, 70, "Adware.A", "Adware.B")
+        // The same two engines in MetaDefender: still 2 engines, Yellow.
+        val sameEngines = found(2, 38, "Adware.A", "Adware.B")
+        assertEquals(listOf(ShieldWarningReason.EnginesFlagged), reasonsOf(verdict(listOf(file("a", vt, sameEngines)))))
+        // Two different engines in MetaDefender: 4 distinct engines, Red.
+        val otherEngines = VtLookupResult.Found(
+            2, 0, 38, now - 86_400L,
+            listOf(EngineFlag("EngineX", "Adware.C"), EngineFlag("EngineY", "Adware.D")),
+        )
+        assertEquals(listOf(ShieldWarningReason.MalwareDetected), reasonsOf(verdict(listOf(file("a", vt, otherEngines)))))
+    }
+
+    @Test fun aTrustedUpdateIsCleanWithoutKeyButNeverWhenAnEngineFlagsIt() {
+        // Unchanged owner rule: the same signer as the installed app is accepted without an online answer.
+        val unknown = verdict(listOf(file("a", VtLookupResult.UnknownHash)), hasKey = false, trusted = true)
+        assertTrue(unknown is ShieldVerdict.Clean && unknown.trustedUpdate)
+        for (vt in listOf(VtLookupResult.Unavailable, VtLookupResult.RateLimited, VtLookupResult.InvalidKey)) {
+            assertTrue(verdict(listOf(file("a", vt)), trusted = true) is ShieldVerdict.Clean)
+        }
+        val summary = verdict(listOf(file("a", found(0, 5))), trusted = true) as ShieldVerdict.Clean
+        assertEquals("VirusTotal 0/5", summary.vtSummary)
+        // Flagged: the trust does not help, light or serious.
+        assertEquals(listOf(ShieldWarningReason.EnginesFlagged), reasonsOf(verdict(listOf(file("a", found(1, 70, "Riskware.A"))), trusted = true)))
+        assertEquals(listOf(ShieldWarningReason.MalwareDetected), reasonsOf(verdict(listOf(file("a", found(1, 70, "Trojan.A"))), trusted = true)))
+    }
+
+    @Test fun noKeyIsYellowNeverGreenWhenNotATrustedUpdate() {
+        val v = verdict(listOf(file("a", null)), hasKey = false)
+        assertEquals(listOf(ShieldWarningReason.VirusTotalKeyMissing), reasonsOf(v))
+        assertEquals(SecurityTier.Yellow, securityTierOf(v))
         assertTrue(verdict(listOf(file("a", VtLookupResult.UnknownHash)), hasKey = false) is ShieldVerdict.Warning)
     }
 
-    @Test fun ruleEUnreachableRateLimitedOrRejectedKeyBlocks() {
-        for (vt in listOf(VtLookupResult.Unavailable, VtLookupResult.RateLimited, VtLookupResult.InvalidKey)) {
-            assertEquals(listOf(ShieldWarningReason.VirusTotalUnreachable), reasonsOf(verdict(listOf(file("a", known), file("b", vt)))))
+    @Test fun unreachableRateLimitedOrRejectedKeyAreYellowWithTheirOwnReason() {
+        // Audit F4: these were Red with no way out, while no key at all was Yellow.
+        val expected = mapOf(
+            VtLookupResult.Unavailable to ShieldWarningReason.VirusTotalUnreachable,
+            VtLookupResult.RateLimited to ShieldWarningReason.OnlineRateLimited,
+            VtLookupResult.InvalidKey to ShieldWarningReason.OnlineKeyRejected,
+        )
+        for ((failure, reason) in expected) {
+            val v = verdict(listOf(file("a", known), file("b", failure)))
+            assertEquals(listOf(reason), reasonsOf(v))
+            assertEquals(SecurityTier.Yellow, securityTierOf(v))
+            assertFalse(mayInstall(v, userOverridden = false))
+            assertTrue(mayInstall(v, userOverridden = true))
         }
-        // Beats an unknown file next to it: the upload is not offered while the service is failing.
-        assertEquals(
-            listOf(ShieldWarningReason.VirusTotalUnreachable),
-            reasonsOf(verdict(listOf(file("a", VtLookupResult.UnknownHash), file("b", VtLookupResult.Unavailable)))),
-        )
-        // Nothing to look at is not proof.
-        assertEquals(listOf(ShieldWarningReason.VirusTotalUnreachable), reasonsOf(verdict(emptyList())))
+        // The upload is not offered while the service is failing.
+        val mixed = verdict(listOf(file("a", VtLookupResult.UnknownHash), file("b", VtLookupResult.Unavailable)))
+        assertEquals(listOf(ShieldWarningReason.NotKnownToVirusTotal, ShieldWarningReason.VirusTotalUnreachable), reasonsOf(mixed))
+        // Nothing to look at is not proof, but it is not a block either.
+        val none = verdict(emptyList())
+        assertEquals(listOf(ShieldWarningReason.VirusTotalUnreachable), reasonsOf(none))
+        assertEquals(SecurityTier.Yellow, securityTierOf(none))
     }
 
-    @Test fun ruleFTooFewEnginesBlocks() {
-        assertEquals(listOf(ShieldWarningReason.TooFewEngines), reasonsOf(verdict(listOf(file("a", VtLookupResult.Found(0, 0, 19))))))
-        assertEquals(
-            listOf(ShieldWarningReason.TooFewEngines),
-            reasonsOf(verdict(listOf(file("a", VtLookupResult.UnknownHash), file("b", VtLookupResult.Found(0, 0, 3))))),
-        )
-        assertTrue(verdict(listOf(file("a", VtLookupResult.Found(0, 0, MinVtEngines)))) is ShieldVerdict.Clean)
+    @Test fun oneFailingSourceNeverHidesTheOtherOnesAnswer() {
+        for (failure in listOf(VtLookupResult.Unavailable, VtLookupResult.RateLimited, VtLookupResult.InvalidKey)) {
+            val clean = verdict(listOf(file("a", failure, found(0, 38))))
+            assertTrue("MetaDefender answered, $failure", clean is ShieldVerdict.Clean)
+            val flagged = verdict(listOf(file("a", failure, found(5, 38))))
+            assertEquals(listOf(ShieldWarningReason.MalwareDetected), reasonsOf(flagged))
+        }
+        // The report says which source failed.
+        val v = verdict(listOf(file("a", VtLookupResult.RateLimited, found(0, 38)))) as ShieldVerdict.Clean
+        val sources = v.report!!.files.single().sources
+        assertEquals(SourceStatus.RateLimited, sources.first { it.source == ShieldSource.VirusTotal }.status)
+        assertEquals(SourceStatus.Answered, sources.first { it.source == ShieldSource.MetaDefender }.status)
     }
 
-    @Test fun ruleGUnknownFilesNeedAnUploadUnlessTooLarge() {
+    @Test fun anUnknownFileIsOnlyUnknownWhenEveryAskedSourceSaidSo() {
+        // Audit F5: a rate-limited source plus an "unknown" one is "not checked", not "unknown".
+        assertEquals(
+            listOf(ShieldWarningReason.OnlineRateLimited),
+            reasonsOf(verdict(listOf(file("a", VtLookupResult.RateLimited, VtLookupResult.UnknownHash)))),
+        )
+        assertEquals(
+            listOf(ShieldWarningReason.OnlineKeyRejected),
+            reasonsOf(verdict(listOf(file("a", VtLookupResult.InvalidKey, VtLookupResult.UnknownHash)))),
+        )
+        assertTrue(verdict(listOf(file("a", VtLookupResult.UnknownHash, VtLookupResult.UnknownHash))) is ShieldVerdict.NeedsUpload)
+        assertTrue(verdict(listOf(file("a", VtLookupResult.UnknownHash, null))) is ShieldVerdict.NeedsUpload)
+    }
+
+    @Test fun fewEnginesAreYellowAndNotBlocking() {
+        // Audit F40: MetaDefender may answer with fewer than 20 engines; that must not be a Red block.
+        assertEquals(listOf(ShieldWarningReason.TooFewEngines), reasonsOf(verdict(listOf(file("a", found(0, 19))))))
+        assertEquals(listOf(ShieldWarningReason.TooFewEngines), reasonsOf(verdict(listOf(file("a", null, found(0, 12))))))
+        assertEquals(SecurityTier.Yellow, securityTierOf(verdict(listOf(file("a", found(0, 3))))))
+        assertTrue(verdict(listOf(file("a", found(0, MinVtEngines)))) is ShieldVerdict.Clean)
+        // Two sources: the bigger engine count is the one that counts.
+        assertTrue(verdict(listOf(file("a", found(0, 62), found(0, 12)))) is ShieldVerdict.Clean)
+    }
+
+    @Test fun anOldAnalysisIsYellow() {
+        // Audit F7: an analysis from years ago says nothing about malware that appeared later.
+        fun at(daysAgo: Long) = VtLookupResult.Found(0, 0, 70, now - daysAgo * 86_400L)
+        assertTrue(verdict(listOf(file("a", at(29)))) is ShieldVerdict.Clean)
+        assertTrue(verdict(listOf(file("a", at(30)))) is ShieldVerdict.Clean)
+        assertEquals(listOf(ShieldWarningReason.StaleAnalysis), reasonsOf(verdict(listOf(file("a", at(31))))))
+        assertEquals(listOf(ShieldWarningReason.StaleAnalysis), reasonsOf(verdict(listOf(file("a", at(900))))))
+        // One fresh dated source is enough; an undated answer does not make an old one fresh.
+        assertTrue(verdict(listOf(file("a", at(900), at(2)))) is ShieldVerdict.Clean)
+        assertEquals(listOf(ShieldWarningReason.StaleAnalysis), reasonsOf(verdict(listOf(file("a", at(900), VtLookupResult.Found(0, 0, 38))))))
+        assertTrue(verdict(listOf(file("a", VtLookupResult.Found(0, 0, 70)))) is ShieldVerdict.Clean)
+    }
+
+    @Test fun unknownFilesNeedAnUploadUnlessTooLarge() {
         val v = verdict(listOf(file("a", known), file("b", VtLookupResult.UnknownHash, size = 5_000_000L), file("c", VtLookupResult.UnknownHash)))
+        assertTrue(v is ShieldVerdict.NeedsUpload)
         assertEquals(
-            ShieldVerdict.NeedsUpload(
-                sha,
-                listOf(UploadCandidate("b", 5_000_000L, "b".padEnd(64, '0')), UploadCandidate("c", 1_000_000L, "c".padEnd(64, '0'))),
-                cleanOffline,
-            ),
-            v,
+            listOf(UploadCandidate("b", 5_000_000L, "b".padEnd(64, '0')), UploadCandidate("c", 1_000_000L, "c".padEnd(64, '0'))),
+            (v as ShieldVerdict.NeedsUpload).files,
         )
         assertTrue(verdict(listOf(file("a", VtLookupResult.UnknownHash, size = MaxVtUploadBytes))) is ShieldVerdict.NeedsUpload)
-        assertEquals(
-            listOf(ShieldWarningReason.TooLargeToVerify),
-            reasonsOf(verdict(listOf(file("a", VtLookupResult.UnknownHash, size = MaxVtUploadBytes + 1), file("b", VtLookupResult.UnknownHash)))),
-        )
+        // A file nobody knows and that cannot be uploaded is Yellow (the user decides), not a hard block.
+        val tooLarge = reasonsOf(verdict(listOf(file("a", VtLookupResult.UnknownHash, size = MaxVtUploadBytes + 1), file("b", VtLookupResult.UnknownHash))))
+        assertEquals(listOf(ShieldWarningReason.NotKnownToVirusTotal), tooLarge)
+        assertEquals(SecurityTier.Yellow, securityTierOf(ShieldVerdict.Warning(sha, tooLarge, 0, 0)))
+        // No VirusTotal key (only MetaDefender): nothing can be uploaded.
+        assertEquals(listOf(ShieldWarningReason.NotKnownToVirusTotal), reasonsOf(verdict(listOf(file("a", null, VtLookupResult.UnknownHash)), canUpload = false)))
     }
 
-    @Test fun ruleHAllKnownAndCleanIsCleanWithSmallestEngineCount() {
-        assertEquals(ShieldVerdict.Clean(sha, "0/62", cleanOffline), verdict(listOf(file("a", known))))
-        assertEquals(
-            ShieldVerdict.Clean(sha, "0/58, 3 files", cleanOffline),
-            verdict(listOf(file("a", known), file("b", VtLookupResult.Found(0, 0, 58)), file("c", VtLookupResult.Found(0, 0, 70)))),
+    @Test fun allKnownAndCleanIsCleanWithTheSummaryOfEverySource() {
+        val single = verdict(listOf(file("a", known))) as ShieldVerdict.Clean
+        assertEquals("VirusTotal 0/62", single.vtSummary)
+        val both = verdict(listOf(file("a", known, found(0, 38)))) as ShieldVerdict.Clean
+        assertEquals("VirusTotal 0/62 \u00b7 MetaDefender 0/38", both.vtSummary)
+        val bundle = verdict(listOf(file("a", known), file("b", found(0, 58)), file("c", found(0, 70)))) as ShieldVerdict.Clean
+        assertEquals("VirusTotal 0/58 (\u00d73)", bundle.vtSummary)
+        assertEquals("a", single.report!!.analysedName)
+    }
+
+    @Test fun resourceOnlySplitsAreIgnoredByTheOnlineRules() {
+        val files = listOf(
+            ShieldFileEvidence("base.apk", 1000L, "a".repeat(64), found(0, 60)),
+            ShieldFileEvidence("config.pt.apk", 10L, "b".repeat(64), lookedUp = false),
         )
+        assertTrue(verdict(files) is ShieldVerdict.Clean)
     }
 
     @Test fun afterTheUploadTheSameFunctionDecidesAgain() {
         val before = listOf(file("a", VtLookupResult.UnknownHash))
         assertTrue(verdict(before) is ShieldVerdict.NeedsUpload)
-        assertEquals(ShieldVerdict.Clean(sha, "0/64", cleanOffline), verdict(listOf(file("a", VtLookupResult.Found(0, 0, 64)))))
-        assertEquals(listOf(ShieldWarningReason.MalwareDetected), reasonsOf(verdict(listOf(file("a", VtLookupResult.Found(2, 0, 64))))))
-        assertEquals(listOf(ShieldWarningReason.TooFewEngines), reasonsOf(verdict(listOf(file("a", VtLookupResult.Found(0, 0, 8))))))
+        assertTrue(verdict(listOf(file("a", found(0, 64)))) is ShieldVerdict.Clean)
+        assertEquals(listOf(ShieldWarningReason.EnginesFlagged), reasonsOf(verdict(listOf(file("a", found(2, 64, "Adware.A", "Adware.B"))))))
+        assertEquals(listOf(ShieldWarningReason.TooFewEngines), reasonsOf(verdict(listOf(file("a", found(0, 8))))))
+    }
+
+    @Test fun aLoneSelfUpdaterPermissionIsInformationNotAWarning() {
+        // Audit F32: nearly every app with its own updater asks for REQUEST_INSTALL_PACKAGES.
+        val offline = cleanOffline.copy(reasons = listOf(ShieldWarningReason.SelfUpdaterPermission))
+        assertTrue(verdict(listOf(file("a", known)), offline = offline) is ShieldVerdict.Clean)
+        // Together with another finding it is listed.
+        val withOther = verdict(listOf(file("a", found(1, 70, "Riskware.A"))), offline = offline)
+        assertEquals(listOf(ShieldWarningReason.EnginesFlagged, ShieldWarningReason.SelfUpdaterPermission), reasonsOf(withOther))
+        // It does not stop an update of the installed app from being trusted (audit F25, second half).
+        val installed = InstalledAppInfo(versionCode = 10L, sigSha256 = "aa".repeat(32))
+        assertTrue(isTrustedUpdate(offline, installed))
+    }
+
+    @Test fun reasonsAreOrderedByGravity() {
+        // Audit F13: the most serious reason leads.
+        val offline = cleanOffline.copy(reasons = listOf(ShieldWarningReason.SelfUpdaterPermission, ShieldWarningReason.AdwareDetected))
+        val v = verdict(listOf(file("a", found(0, 62, suspicious = 0))), offline = offline)
+        assertEquals(listOf(ShieldWarningReason.AdwareDetected, ShieldWarningReason.SelfUpdaterPermission), reasonsOf(v))
     }
 
     @Test fun trustedUpdateNeedsSameSignerNotOlderVersionAndCleanOfflineReport() {
@@ -524,13 +687,29 @@ class SecurityShieldTest {
     // ---- 3-Color Security Tiers (Green / Yellow / Red) ----
 
     @Test fun securitySeverityCategorizesRedVsYellowReasons() {
-        // Yellow (Caution / Mod Risk / User Decision)
-        assertEquals(SecuritySeverity.Yellow, ShieldWarningReason.DropperDetected.severity())
-        assertEquals(SecuritySeverity.Yellow, ShieldWarningReason.DebugOrTestCertificate.severity())
-        assertEquals(SecuritySeverity.Yellow, ShieldWarningReason.NotKnownToVirusTotal.severity())
-        assertEquals(SecuritySeverity.Yellow, ShieldWarningReason.VirusTotalKeyMissing.severity())
+        // Yellow (Caution / Mod Risk / User Decision): a missing proof is never Red.
+        val yellowReasons = listOf(
+            ShieldWarningReason.DropperDetected,
+            ShieldWarningReason.DebugOrTestCertificate,
+            ShieldWarningReason.NotKnownToVirusTotal,
+            ShieldWarningReason.VirusTotalKeyMissing,
+            ShieldWarningReason.EnginesFlagged,
+            ShieldWarningReason.VirusTotalUnreachable,
+            ShieldWarningReason.OnlineRateLimited,
+            ShieldWarningReason.OnlineKeyRejected,
+            ShieldWarningReason.TooFewEngines,
+            ShieldWarningReason.StaleAnalysis,
+            ShieldWarningReason.ScanIncomplete,
+            ShieldWarningReason.InvalidNativeLibrary,
+            ShieldWarningReason.RiskyPermissionCombo,
+            ShieldWarningReason.SuspiciousNativeCode,
+            ShieldWarningReason.SelfUpdaterPermission,
+        )
+        for (reason in yellowReasons) {
+            assertEquals("Expected $reason to have Yellow severity", SecuritySeverity.Yellow, reason.severity())
+        }
 
-        // Red (Critical / Hard Block)
+        // Red (Critical / Hard Block): proof of harm or of a forged package.
         val redReasons = listOf(
             ShieldWarningReason.MalwareDetected,
             ShieldWarningReason.AdwareDetected,
@@ -539,13 +718,15 @@ class SecurityShieldTest {
             ShieldWarningReason.UnsignedPackage,
             ShieldWarningReason.PackageMismatch,
             ShieldWarningReason.VersionDowngrade,
-            ShieldWarningReason.VirusTotalUnreachable,
-            ShieldWarningReason.TooFewEngines,
-            ShieldWarningReason.TooLargeToVerify,
+            ShieldWarningReason.CompromisedKey,
+            ShieldWarningReason.LegacySignatureOnly,
+            ShieldWarningReason.MalformedArchive,
         )
         for (reason in redReasons) {
             assertEquals("Expected $reason to have Red severity", SecuritySeverity.Red, reason.severity())
         }
+        // Every reason is in exactly one of the two lists.
+        assertEquals(ShieldWarningReason.entries.toSet(), (yellowReasons + redReasons).toSet())
     }
 
     @Test fun securityTierEvaluatesVerdictColor() {

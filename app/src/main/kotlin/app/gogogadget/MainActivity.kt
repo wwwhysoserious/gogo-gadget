@@ -7,6 +7,7 @@ import android.os.Build
 import android.provider.Settings
 import android.content.ActivityNotFoundException
 import android.content.res.Configuration
+import android.net.Uri
 import android.graphics.Color.TRANSPARENT
 import android.graphics.drawable.ColorDrawable
 import android.os.Bundle
@@ -59,6 +60,30 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         refreshNotifications()
+        // In front again: the saved devices are probed at once and the connected session is looked after (pings only in front).
+        model.appVisible(true)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        receiveIncoming(intent)
+    }
+
+    /** A package opened with GoGo ("Open with") or shared to it: copied at once, because the grant is temporary. */
+    private fun receiveIncoming(intent: Intent) {
+        val uri = when (intent.action) {
+            Intent.ACTION_VIEW -> intent.data
+            Intent.ACTION_SEND ->
+                if (Build.VERSION.SDK_INT >= 33) intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+                else @Suppress("DEPRECATION") intent.getParcelableExtra(Intent.EXTRA_STREAM)
+            else -> null
+        } ?: return
+        model.receiveFile(uri)
+    }
+
+    override fun onPause() {
+        model.appVisible(false)
+        super.onPause()
     }
 
     private val notificationPermission =
@@ -104,6 +129,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // After a rotation or process restart the same intent comes back; its file was already taken.
+        if (savedInstanceState == null) receiveIncoming(intent)
         val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         var setting by mutableStateOf(themeSettingFromName(prefs.getString(KEY_THEME, null)))
         val systemDark = (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
@@ -117,10 +144,18 @@ class MainActivity : ComponentActivity() {
                 var tab by rememberSaveable { mutableStateOf(Tab.Install) }
                 var themeOpen by rememberSaveable { mutableStateOf(false) }
                 var vtKeyOpen by rememberSaveable { mutableStateOf(false) }
+                var vtKeyFromHome by rememberSaveable { mutableStateOf(false) }
                 var infoOpen by rememberSaveable { mutableStateOf(false) }
+                var howOpen by rememberSaveable { mutableStateOf(false) }
+                var keysVersion by rememberSaveable { mutableStateOf(0) }
+                val shieldStore = remember { ShieldSettingsStore(this@MainActivity) }
+                val installStore = remember { InstallSettingsStore(this@MainActivity) }
+                // First launch only, and never for someone who already has a key: recommend the API keys once.
+                var welcomeOpen by rememberSaveable { mutableStateOf(!installStore.welcomeSeen && !shieldStore.hasAnyApiKey()) }
                 var devicesOpen by rememberSaveable { mutableStateOf(false) }
                 val connection = model.connection
                 val found by model.found.collectAsState()
+                val terminal by model.terminal.collectAsState()
                 // Pairing this phone: ask for the notification permission once, right when it is needed.
                 val pairingThisDevice = connection.state == ConnectionState.Pairing && connection.device?.local == true
                 LaunchedEffect(pairingThisDevice, notificationsOk) {
@@ -130,32 +165,66 @@ class MainActivity : ComponentActivity() {
                 val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
                     model.installFrom(uri)
                 }
+                // A file waiting for a device or for the running install starts as soon as both allow it.
+                LaunchedEffect(model.pendingFile, connection.state, model.install?.working) { model.startPendingFile() }
                 DisposableEffect(devicesOpen) {
                     model.scanForPicker(devicesOpen)
                     onDispose { model.scanForPicker(false) }
                 }
                 // Back closes the info balloon, then the device list, then the Settings sub-screens, then returns to Install.
-                BackHandler(infoOpen || devicesOpen || tab != Tab.Install) {
+                BackHandler(infoOpen || devicesOpen || howOpen || tab != Tab.Install) {
                     if (infoOpen) infoOpen = false
+                    else if (howOpen) howOpen = false
                     else if (devicesOpen) devicesOpen = false
                     else if (tab == Tab.Settings && themeOpen) themeOpen = false
-                    else if (tab == Tab.Settings && vtKeyOpen) vtKeyOpen = false
+                    else if (tab == Tab.Settings && vtKeyOpen) {
+                        vtKeyOpen = false
+                        if (vtKeyFromHome) {
+                            vtKeyFromHome = false
+                            tab = Tab.Install
+                        }
+                    }
                     else tab = Tab.Install
                 }
+                val menu = remember(model.recent, model.reachable, model.subnets, connection) {
+                    val own = ownAddresses()
+                    deviceMenuEntries(
+                        model.thisDevice(), model.recent, model.subnets, model.reachable,
+                        connection.device?.takeIf { connection.state == ConnectionState.Connected }?.host, own,
+                    )
+                }
+                // Maximum protection means the Shield is enabled, an online key is set and the deep scan is on: without the
+                // deep scan the dropper, adware, permission and native-library rules do not run.
+                var shieldVersion by rememberSaveable { mutableStateOf(0) }
+                val isMaximum = remember(tab, keysVersion, shieldVersion, welcomeOpen) {
+                    shieldStore.shieldEnabled && shieldStore.hasAnyApiKey() && shieldStore.deepScanEnabled
+                }
                 Column(Modifier.fillMaxSize().background(Color(palette.background)).windowInsetsPadding(WindowInsets.safeDrawing)) {
+                    if (welcomeOpen) {
+                        Box(Modifier.weight(1f).fillMaxWidth()) {
+                            WelcomeScreen(
+                                palette,
+                                onSetUp = { installStore.welcomeSeen = true; welcomeOpen = false; tab = Tab.Settings; vtKeyOpen = true; vtKeyFromHome = true },
+                                onSkip = { installStore.welcomeSeen = true; welcomeOpen = false },
+                            )
+                        }
+                        return@Column
+                    }
                     Box(Modifier.weight(1f).fillMaxWidth()) {
                         when (tab) {
-                            Tab.Install -> if (devicesOpen) {
+                            Tab.Install -> if (howOpen) {
+                                HowItWorksScreen(palette, onBack = { howOpen = false })
+                            } else if (devicesOpen) {
                                 val own = remember(found) { ownAddresses() }
                                 DevicesScreen(
                                     palette = palette,
-                                    thisDevice = model.thisDevice(),
+                                    sections = menu,
                                     found = found,
                                     ownAddresses = own,
-                                    recent = model.recent,
-                                    connected = connection.state == ConnectionState.Connected,
+                                    onOpen = { model.probeDevices() },
+                                    onRefresh = { model.probeDevices() },
                                     onBack = { devicesOpen = false },
-                                    onThisDevice = { devicesOpen = false; model.connect(model.thisDevice()) },
+                                    onSelect = { devicesOpen = false; model.connect(it) },
                                     onFound = {
                                         devicesOpen = false
                                         val target = Target(it.name.orEmpty(), it.host, 0)
@@ -164,13 +233,13 @@ class MainActivity : ComponentActivity() {
                                             is TapAction.Pair -> model.startPairing(target, tap.pairPort)
                                         }
                                     },
-                                    onManual = { endpoint, pair ->
+                                    onManual = { endpoint, pair, customName ->
                                         devicesOpen = false
-                                        if (pair) model.startPairing(Target(endpoint.host, endpoint.host, 0), endpoint.port)
-                                        else model.connect(Target(endpoint.host, endpoint.host, endpoint.port))
+                                        val devName = customName ?: endpoint.host
+                                        if (pair) model.startPairing(Target(devName, endpoint.host, 0), endpoint.port)
+                                        else model.connect(Target(devName, endpoint.host, endpoint.port))
                                     },
-                                    onRecent = { devicesOpen = false; model.connect(it) },
-                                    onDisconnect = { devicesOpen = false; model.cancel() },
+                                    onForget = model::forget,
                                 )
                             } else HomeScreen(
                                 palette = palette,
@@ -180,8 +249,6 @@ class MainActivity : ComponentActivity() {
                                 pairPort = model.pairPort,
                                 onCode = { model.submitCode(it) },
                                 onRepost = model::repostNotification,
-                                notificationsOk = notificationsOk,
-                                onAllowNotifications = ::allowNotifications,
                                 onOpenDeveloperOptions = ::openDeveloperOptions,
                                 onInfoToggle = { infoOpen = !infoOpen },
                                 onConfirmUpload = model::confirmUpload,
@@ -189,6 +256,37 @@ class MainActivity : ComponentActivity() {
                                 onConfirmCaution = model::confirmCaution,
                                 onCancelCaution = model::cancelCaution,
                                 onDeleteSource = model::deleteSourcePackage,
+                                pendingName = model.pendingFile?.name,
+                                onCancelPending = model::cancelPendingFile,
+                                log = terminal,
+                                menu = menu,
+                                onSelectDevice = { model.connect(it) },
+                                onAddDevice = { devicesOpen = true },
+                                onMenuOpen = { model.probeDevices() },
+                                onMenuRefresh = { model.probeDevices() },
+                                maximumProtection = isMaximum,
+                                hasSecurityKeys = shieldStore.hasAnyApiKey(),
+                                onStartActivation = {
+                                    shieldStore.shieldEnabled = true
+                                    // Maximum protection includes the deep scan.
+                                    shieldStore.deepScanEnabled = true
+                                    shieldVersion++
+                                },
+                                onStartDeactivation = {
+                                    shieldStore.shieldEnabled = false
+                                    shieldVersion++
+                                },
+                                onOpenSecurityApis = {
+                                    if (shieldStore.hasAnyApiKey()) {
+                                        shieldStore.shieldEnabled = !shieldStore.shieldEnabled
+                                        shieldVersion++
+                                    } else {
+                                        tab = Tab.Settings
+                                        vtKeyOpen = true
+                                        vtKeyFromHome = true
+                                    }
+                                },
+                                onHowItWorks = { howOpen = true },
                                 onButton = { action ->
                                     when (action) {
                                         ButtonAction.ChooseDevice -> devicesOpen = true
@@ -210,8 +308,16 @@ class MainActivity : ComponentActivity() {
                                     tab = Tab.Install
                                 },
                                 onDelete = { backup ->
-                                    model.deleteBackup(backup.packageName)
+                                    model.deleteBackup(backup)
                                 },
+                                connectedDeviceId = model.connection.device?.takeIf { model.connection.state == ConnectionState.Connected }?.backupId(),
+                                connectedDeviceName = model.connection.device?.name,
+                                onRevertMany = { list ->
+                                    model.revertBackups(list)
+                                    tab = Tab.Install
+                                },
+                                onDeleteMany = { list -> model.deleteBackups(list) },
+                                onGoToInstall = { tab = Tab.Install },
                             )
                             Tab.Settings -> SettingsScreen(
                                 palette = palette,
@@ -223,11 +329,22 @@ class MainActivity : ComponentActivity() {
                                     prefs.edit().putString(KEY_THEME, it.name).apply()
                                 },
                                 vtKeyOpen = vtKeyOpen,
-                                onVtKeyOpen = { vtKeyOpen = it },
+                                onVtKeyOpen = { open ->
+                                    vtKeyOpen = open
+                                    if (!open && vtKeyFromHome) {
+                                        vtKeyFromHome = false
+                                        tab = Tab.Install
+                                    }
+                                },
+                                onKeysChanged = {
+                                    keysVersion++
+                                    // Verdicts stored for a key that was just changed or removed are not trusted any more.
+                                    model.clearReputationCache()
+                                },
                             )
                         }
                     }
-                    BottomBar(palette, tab) { tab = it; themeOpen = false; vtKeyOpen = false }
+                    BottomBar(palette, tab) { tab = it; themeOpen = false; vtKeyOpen = false; howOpen = false; vtKeyFromHome = false }
                 }
             }
         }

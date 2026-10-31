@@ -20,14 +20,13 @@ import kotlinx.coroutines.withContext
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 
-private const val LOOPBACK_HOST = "127.0.0.1"
-
 /**
  * Pairs with this phone's own Wireless debugging, following Shizuku's design: a short foreground service shows a
  * "searching" notification, accepts only a pairing service that belongs to this phone ([acceptOwnPairing]), asks for
  * the code in the notification's inline reply (so the system pairing dialog can stay on screen), pairs to 127.0.0.1
- * and reports the result. The code lives only in the reply's result Intent and a local variable: it is never
- * persisted, logged or put in a notification.
+ * (then to the dialog's own address if that is refused) and reports the result. The pairing runs under the shared ADB
+ * lock ([Graph.adbLock]), so this phone's key is never deleted while it is in use. The code lives only in the reply's
+ * result Intent and a local variable: it is never persisted, logged or put in a notification.
  *
  * All state below is touched on the main thread only.
  */
@@ -35,6 +34,7 @@ class PairingService : Service() {
     companion object {
         const val KEY_CODE = "pairing_code"
         private const val KEY_PORT = "pairing_port"
+        private const val KEY_HOST = "pairing_host"
         private const val ACTION_START = "app.gogogadget.action.PAIRING_START"
         private const val ACTION_STOP = "app.gogogadget.action.PAIRING_STOP"
         private const val ACTION_REPLY = "app.gogogadget.action.PAIRING_REPLY"
@@ -45,8 +45,8 @@ class PairingService : Service() {
         fun stopIntent(context: Context): Intent =
             Intent(context, PairingService::class.java).setAction(ACTION_STOP)
 
-        fun replyIntent(context: Context, port: Int): Intent =
-            Intent(context, PairingService::class.java).setAction(ACTION_REPLY).putExtra(KEY_PORT, port)
+        fun replyIntent(context: Context, port: Int, host: String?): Intent =
+            Intent(context, PairingService::class.java).setAction(ACTION_REPLY).putExtra(KEY_PORT, port).putExtra(KEY_HOST, host)
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -54,8 +54,8 @@ class PairingService : Service() {
     private var search: Job? = null
     private var discovery: DeviceDiscovery? = null
 
-    /** The pairing port of this phone's dialog; null while it is not on screen. */
-    private var port: Int? = null
+    /** The pairing service of this phone's dialog (its own address and port); null while it is not on screen. */
+    private var dialog: Endpoint? = null
 
     private var busy = false
 
@@ -97,7 +97,7 @@ class PairingService : Service() {
         discovery = nsd
         search = scope.launch {
             nsd.found
-                .map { acceptOwnPairing(it, ownAddresses(), ::portInUse)?.port }
+                .map { acceptOwnPairing(it, ownAddresses(), ::portInUse)?.let { f -> Endpoint(f.host, f.port) } }
                 .distinctUntilChanged()
                 .collect { seen -> withContext(Dispatchers.Main) { onPort(seen) } }
         }
@@ -112,12 +112,15 @@ class PairingService : Service() {
 
     // Binding fails only when a service of this phone already listens on the port.
     private fun portInUse(port: Int): Boolean = isPortBoundLocally(port) {
-        ServerSocket().use { socket -> socket.bind(InetSocketAddress(LOOPBACK_HOST, it), 1) }
+        ServerSocket().use { socket -> socket.bind(InetSocketAddress(LoopbackHost, it), 1) }
     }
 
-    private fun onPort(seen: Int?) {
-        port = seen
-        if (seen != null && !busy) show(notifier.found(seen), foreground = false)
+    private fun onPort(seen: Endpoint?) {
+        val lost = dialog != null && seen == null
+        dialog = seen
+        if (seen != null && !busy) show(notifier.found(seen.port, seen.host), foreground = false)
+        // The dialog was closed: the guide comes back.
+        else if (lost && !busy) show(notifier.searching(), foreground = false)
     }
 
     private fun shutdown() {
@@ -131,6 +134,7 @@ class PairingService : Service() {
         if (busy) return
         val raw = RemoteInput.getResultsFromIntent(intent)?.getCharSequence(KEY_CODE)
         val port = intent.getIntExtra(KEY_PORT, -1)
+        val host = intent.getStringExtra(KEY_HOST)
         when (val decision = decideReply(raw, port)) {
             ReplyDecision.NoPort -> {
                 // Nothing to pair with: look for the dialog again.
@@ -138,41 +142,50 @@ class PairingService : Service() {
                 startSearch()
             }
             ReplyDecision.BadCode -> {
-                show(notifier.found(port, R.string.notif_bad_code), foreground = true)
+                show(notifier.found(port, host, R.string.notif_bad_code), foreground = true)
                 startSearch()
             }
             is ReplyDecision.Submit -> {
                 show(notifier.working(), foreground = true)
-                pair(decision.code, decision.port)
+                pair(decision.code, decision.port, host)
             }
         }
     }
 
-    private fun pair(code: String, port: Int) {
+    private fun pair(code: String, port: Int, seenHost: String?) {
         busy = true
+        val hosts = servicePairingHosts(seenHost, ownAddresses())
         scope.launch(Dispatchers.IO) {
-            val error = try {
-                Graph.adb(this@PairingService).pair(LOOPBACK_HOST, port, code)
-                null
-            } catch (e: Exception) {
-                e
-            }
-            withContext(Dispatchers.Main) { finish(error) }
+            // Under the shared ADB lock; every failure is classified, logged and returned, never thrown.
+            val outcome = runLocalPairing(Graph.adb(this@PairingService), Graph.adbLock, hosts, port, code, Graph.log::add)
+            withContext(Dispatchers.Main) { finish(outcome) }
         }
     }
 
-    private fun finish(error: Exception?) {
+    private fun finish(outcome: PairOutcome) {
         busy = false
-        val message = if (error == null) {
+        val failure = outcome as? PairOutcome.Failed
+        val message = if (failure == null) {
             // The app connects by itself when it is running; otherwise the user opens it.
             if (PairingBridge.paired()) R.string.notif_paired_connecting else R.string.notif_paired_open_app
         } else {
-            classifyError(error, Phase.Pair, local = true).message
+            PairingBridge.failed(failure.error, failure.detail)
+            failure.error.message
         }
         stopSearch()
         stopForeground(STOP_FOREGROUND_REMOVE)
-        notifier.post(notifier.result(message))
+        notifier.post(notifier.result(message, failure?.exceptionName))
+        // Back to the app after a successful pairing, where the OS allows it; the notification's tap opens it otherwise.
+        if (failure == null) openApp()
         stopSelf()
+    }
+
+    private fun openApp() {
+        runCatching {
+            startActivity(
+                Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP),
+            )
+        }
     }
 
     private fun show(notification: Notification, foreground: Boolean) {

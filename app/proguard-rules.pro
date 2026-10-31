@@ -12,3 +12,6 @@
 -keep class org.conscrypt.OpenSSLProvider { <init>(); }
 -keep class org.conscrypt.Conscrypt { public static byte[] exportKeyingMaterial(javax.net.ssl.SSLSocket, java.lang.String, byte[], int); }
 -dontwarn org.conscrypt.**
+
+# LibAdbTls drops libadb-android's process-wide cached SSLContext (see AdbTls.kt) by reflection on this field.
+-keep class io.github.muntashirakon.adb.SslUtils { static javax.net.ssl.SSLContext sslContext; }
