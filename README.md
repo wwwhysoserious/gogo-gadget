@@ -3,6 +3,12 @@
 </p>
 
 <p align="center">
+  <a href="README.md"><img src="https://img.shields.io/badge/Language-English-00E676?style=for-the-badge&logo=google-translate&logoColor=white" alt="English"></a>
+  <a href="README.pt.md"><img src="https://img.shields.io/badge/Idioma-Portugu%C3%AAs-blue?style=for-the-badge&logo=google-translate&logoColor=white" alt="Português"></a>
+  <a href="README.es.md"><img src="https://img.shields.io/badge/Idioma-Espa%C3%B1ol-orange?style=for-the-badge&logo=google-translate&logoColor=white" alt="Español"></a>
+</p>
+
+<p align="center">
   <a href="https://github.com/wwwhysoserious/gogo-gadget/releases/latest"><img src="https://img.shields.io/github/v/release/wwwhysoserious/gogo-gadget?color=00E676&label=Release&logo=android&logoColor=white&style=for-the-badge" alt="Latest Release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-GPL--3.0-blue.svg?style=for-the-badge" alt="License: GPL-3.0"></a>
   <img src="https://img.shields.io/badge/Android-11%2B%20(API%2030%2B)-3DDC84.svg?style=for-the-badge&logo=android&logoColor=white" alt="Android 11+">
