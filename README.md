@@ -21,6 +21,29 @@ Whether installing split packages (`.apks`, `.xapk`, `.apkm`), deploying to remo
 
 ---
 
+## Why GoGo Gadget? (The Key Differentiators)
+
+Most Android installers fall into one of two traps: they either depend on Google Play / proprietary frameworks, or they require intrusive background daemons and root access. GoGo Gadget takes a fundamentally different path:
+
+| Feature | Standard Package Installer | Shizuku-based Installers | **GoGo Gadget** |
+| :--- | :---: | :---: | :---: |
+| **PC Connection Needed** | Yes (for initial setup) | Often (to start daemon) | **Never** (100% on-device) |
+| **Requires Root Access** | No | Optional / Root Mode | **No** (Zero Root needed) |
+| **Persistent Background Service**| No | Yes (Always running) | **No** (Runs only on-demand) |
+| **Pre-Install Bytecode Security** | None (Basic signature) | None (Blind pass-through) | **Full DEX Bytecode Inspection** |
+| **Automatic Rollback / Backup** | None (Overwrites blindly)| None | **1-Tap Instant Downgrade** |
+| **Splits & Formats (.xapk, .apkm)**| Fails / Incompatible | Manual handling | **Native Seamless Ingestion** |
+| **Remote TV / Local Network Push**| No | No | **Built-in mDNS Network Deploy** |
+| **Google Play / Tracking Libs** | Yes | Optional | **Zero Google Code (100% FOSS)** |
+
+### The Core Strengths
+1. **True Autonomy (No PC & No Running Daemons)**: Connects directly to Android's local pairing service inside the phone. When you close GoGo Gadget, no background daemon stays eating your battery or monitoring your device.
+2. **Built-in Bytecode Antivirus (Pre-Install)**: Before letting an APK touch your system, GoGo Gadget scans the actual DEX headers across `classes.dex`, instantly detecting abusive permissions, obfuscated dynamic class loaders, and hidden binary droppers.
+3. **Fail-Safe 1-Tap Rollback**: Upgraded an app and the new version crashes or has annoying changes? GoGo Gadget automatically archives your previous working version so you can revert with one tap.
+4. **Remote Device Hub**: Install an app on your phone, and push it directly over Wi-Fi to your Android TV or secondary tablet without installing extra apps on the target device.
+
+---
+
 ## Screenshots
 
 <p align="center">
