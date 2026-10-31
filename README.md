@@ -35,18 +35,27 @@ Whether installing split packages (`.apks`, `.xapk`, `.apkm`), deploying to remo
 
 ## How it Works
 
+<p align="center">
+  <img src="assets/diagrams/how-it-works-linear.png" width="75%" alt="GoGo Gadget Linear Architecture" />
+</p>
+
+---
+
+## Promo Video
+
+<p align="center">
+  <a href="https://github.com/wwwhysoserious/gogo-gadget/releases/download/v1.0.0/GoGo-Gadget-Phone-Promo.mp4">
+    <img src="assets/banner.png" width="85%" alt="Watch GoGo Gadget in Action (Promo Video)" />
+    <br>
+    <b>▶️ Click to Watch / Download Phone Promo Video (Full HD 1080p MP4)</b>
+  </a>
+</p>
+
 ```
-+-------------------+       +-----------------------+       +----------------------+
-|   1. Pick File    | ----> | 2. Pre-Install Shield | ----> |  3. Local ADB Engine |
-| APK / XAPK / Splits|       | Bytecode & Hash Scan  |       | Wireless Debugging   |
-+-------------------+       +-----------------------+       +----------------------+
-                                                                       |
-                                                                       v
-                                                            +----------------------+
-                                                            | 4. Safe Install &    |
-                                                            |    1-Tap Revert      |
-                                                            +----------------------+
+https://github.com/wwwhysoserious/gogo-gadget/releases/download/v1.0.0/GoGo-Gadget-Phone-Promo.mp4
 ```
+
+---
 
 1. **Select Package**: Open standard APKs, split APK archives (`APKS`, `APKM`, `XAPK`), or `.zip` bundles. Extraction and validation execute directly in streaming memory without leaving temporary clutter.
 2. **Multi-Tier Security Engine**:
