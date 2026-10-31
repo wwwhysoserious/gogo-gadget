@@ -17,6 +17,10 @@
   <img src="https://img.shields.io/badge/Root-Not%20Required-success.svg?style=for-the-badge" alt="No Root">
 </p>
 
+<p align="center">
+  <b>Language:</b> <b>English</b> | <a href="README.pt.md">Português</a>
+</p>
+
 ---
 
 ## Overview
