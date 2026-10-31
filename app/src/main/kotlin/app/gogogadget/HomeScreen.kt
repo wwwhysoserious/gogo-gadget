@@ -545,7 +545,7 @@ private fun HomeControls(
                 onOpenDeveloperOptions,
                 menu, onSelectDevice, onAddDevice, onMenuOpen, onMenuRefresh,
                 // Terminal mode is measured with a bounded height: the panel's weighted text area would fill it all.
-                modifier = if (fixedPanel) Modifier.height(PanelHeight) else Modifier.heightIn(min = PanelHeight),
+                modifier = if (fixedPanel && connection.error == null) Modifier.height(PanelHeight) else Modifier.heightIn(min = PanelHeight),
             )
         }
         Spacer(Modifier.height(12.dp))
@@ -1456,7 +1456,7 @@ private fun ConnectionPanel(
             Node(palette, R.string.adb, Glyph.Terminal)
         }
         // The state text is centred, both ways, in the space left under the diagram.
-        Box(Modifier.weight(1f).fillMaxWidth().padding(horizontal = 12.dp), contentAlignment = Alignment.Center) {
+        Box(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp), contentAlignment = Alignment.Center) {
             Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
                 connection.error?.let {
                     Text(
