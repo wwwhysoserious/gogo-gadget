@@ -44,16 +44,12 @@ Whether installing split packages (`.apks`, `.xapk`, `.apkm`), deploying to remo
 ## Promo Video
 
 <p align="center">
+  <img src="assets/promo/phone-promo.gif" width="85%" alt="GoGo Gadget Phone Promo Demonstration" />
+  <br>
   <a href="https://github.com/wwwhysoserious/gogo-gadget/releases/download/v1.0.0/GoGo-Gadget-Phone-Promo.mp4">
-    <img src="assets/banner.png" width="85%" alt="Watch GoGo Gadget in Action (Promo Video)" />
-    <br>
-    <b>▶️ Click to Watch / Download Phone Promo Video (Full HD 1080p MP4)</b>
+    <b>⬇️ Download High-Definition Video (Full HD 1080p MP4)</b>
   </a>
 </p>
-
-```
-https://github.com/wwwhysoserious/gogo-gadget/releases/download/v1.0.0/GoGo-Gadget-Phone-Promo.mp4
-```
 
 ---
 
